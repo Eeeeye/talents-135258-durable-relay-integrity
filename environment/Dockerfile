@@ -9,7 +9,6 @@ ENV GOPROXY=off \
 WORKDIR /app
 COPY app/ /app/
 
-RUN go test -buildvcs=false ./... \
-    && make build
+RUN make build
 
 CMD ["/bin/bash"]

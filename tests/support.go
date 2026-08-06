@@ -18,11 +18,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 type verifier struct {
@@ -356,6 +358,23 @@ func startService(binDir, configPath, address, logDir string) (*service, error) 
 	return nil, fmt.Errorf("relayqd did not become ready: %s", strings.TrimSpace(string(raw)))
 }
 
+func setProcessFileSizeLimit(pid int, limit uint64) error {
+	value := syscall.Rlimit{Cur: limit, Max: limit}
+	_, _, errno := syscall.RawSyscall6(
+		syscall.SYS_PRLIMIT64,
+		uintptr(pid),
+		uintptr(syscall.RLIMIT_FSIZE),
+		uintptr(unsafe.Pointer(&value)),
+		0,
+		0,
+		0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 func (s *service) markFinished(err error) {
 	s.mu.Lock()
 	s.finished = true
@@ -561,38 +580,115 @@ func readReceipts(path string) ([]receipt, error) {
 	return result, nil
 }
 
-func readSnapshotLast(path string) (uint64, error) {
+type durableSnapshot struct {
+	Version      int            `json:"version"`
+	LastSequence uint64         `json:"last_sequence"`
+	CreatedAt    time.Time      `json:"created_at"`
+	Jobs         map[string]job `json:"jobs"`
+}
+
+type durableEvent struct {
+	Sequence uint64    `json:"sequence"`
+	Type     string    `json:"type"`
+	At       time.Time `json:"at"`
+	Job      job       `json:"job"`
+}
+
+var durableRequestIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+func readSnapshot(path string) (durableSnapshot, bool, error) {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
+		return durableSnapshot{}, false, nil
 	}
 	if err != nil {
-		return 0, err
+		return durableSnapshot{}, false, err
 	}
-	var value struct {
-		Version      int             `json:"version"`
-		LastSequence uint64          `json:"last_sequence"`
-		CreatedAt    time.Time       `json:"created_at"`
-		Jobs         json.RawMessage `json:"jobs"`
-	}
+	var value durableSnapshot
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&value); err != nil {
-		return 0, err
+		return durableSnapshot{}, false, err
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return 0, errors.New("snapshot has trailing JSON")
+		return durableSnapshot{}, false, errors.New("snapshot has trailing JSON")
 	}
-	if value.Version != 1 || value.CreatedAt.IsZero() || len(value.Jobs) == 0 {
-		return 0, errors.New("snapshot required fields are invalid")
+	if value.Version != 1 || value.CreatedAt.IsZero() || value.Jobs == nil {
+		return durableSnapshot{}, false, errors.New("snapshot required fields are invalid")
 	}
-	return value.LastSequence, nil
+	if len(value.Jobs) > 0 && value.LastSequence == 0 {
+		return durableSnapshot{}, false, errors.New("nonempty snapshot has zero last_sequence")
+	}
+	requests := make(map[string]string, len(value.Jobs))
+	for id, item := range value.Jobs {
+		if id != item.ID {
+			return durableSnapshot{}, false, fmt.Errorf("snapshot key %q differs from job id %q", id, item.ID)
+		}
+		if err := validateDurableJob(item); err != nil {
+			return durableSnapshot{}, false, fmt.Errorf("snapshot job %q: %w", id, err)
+		}
+		if previous, exists := requests[item.Spec.RequestID]; exists && previous != id {
+			return durableSnapshot{}, false, fmt.Errorf("snapshot request_id %q maps to jobs %q and %q", item.Spec.RequestID, previous, id)
+		}
+		requests[item.Spec.RequestID] = id
+	}
+	return value, true, nil
 }
 
 type walScan struct {
 	Records      int
 	LastSequence uint64
+	Events       []durableEvent
+}
+
+type rawWALFrame struct {
+	Header  []byte
+	Payload []byte
+}
+
+func parseRawWALFrames(raw []byte) ([]rawWALFrame, error) {
+	const headerSize = 24
+	var frames []rawWALFrame
+	for offset := 0; offset < len(raw); {
+		if len(raw)-offset < headerSize {
+			return nil, fmt.Errorf("partial raw header at %d", offset)
+		}
+		length := int(binary.LittleEndian.Uint32(raw[offset+8 : offset+12]))
+		end := offset + headerSize + length
+		if length <= 0 || end > len(raw) {
+			return nil, fmt.Errorf("invalid raw frame length %d at %d", length, offset)
+		}
+		frames = append(frames, rawWALFrame{
+			Header:  append([]byte(nil), raw[offset:offset+headerSize]...),
+			Payload: append([]byte(nil), raw[offset+headerSize:end]...),
+		})
+		offset = end
+	}
+	return frames, nil
+}
+
+func encodeRawWALFrames(frames []rawWALFrame) []byte {
+	var result []byte
+	for _, frame := range frames {
+		header := append([]byte(nil), frame.Header...)
+		binary.LittleEndian.PutUint32(header[8:12], uint32(len(frame.Payload)))
+		binary.LittleEndian.PutUint32(header[12:16], crc32.ChecksumIEEE(frame.Payload))
+		result = append(result, header...)
+		result = append(result, frame.Payload...)
+	}
+	return result
+}
+
+func cloneRawWALFrames(frames []rawWALFrame) []rawWALFrame {
+	result := make([]rawWALFrame, len(frames))
+	for index, frame := range frames {
+		result[index] = rawWALFrame{
+			Header:  append([]byte(nil), frame.Header...),
+			Payload: append([]byte(nil), frame.Payload...),
+		}
+	}
+	return result
 }
 
 func scanWAL(path string, snapshotLast uint64) (walScan, error) {
@@ -636,12 +732,7 @@ func scanWAL(path string, snapshotLast uint64) (walScan, error) {
 		if crc32.ChecksumIEEE(payload) != checksum {
 			return result, fmt.Errorf("checksum mismatch at %d", offset)
 		}
-		var event struct {
-			Sequence uint64          `json:"sequence"`
-			Type     string          `json:"type"`
-			At       time.Time       `json:"at"`
-			Job      json.RawMessage `json:"job"`
-		}
+		var event durableEvent
 		decoder := json.NewDecoder(bytes.NewReader(payload))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&event); err != nil {
@@ -651,7 +742,7 @@ func scanWAL(path string, snapshotLast uint64) (walScan, error) {
 		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 			return result, fmt.Errorf("event trailing JSON at %d", offset)
 		}
-		if event.Sequence != sequence || event.At.IsZero() || len(event.Job) == 0 {
+		if event.Sequence != sequence || event.At.IsZero() {
 			return result, fmt.Errorf("event/header mismatch at %d", offset)
 		}
 		switch event.Type {
@@ -659,12 +750,121 @@ func scanWAL(path string, snapshotLast uint64) (walScan, error) {
 		default:
 			return result, fmt.Errorf("invalid event type %q at %d", event.Type, offset)
 		}
+		if err := validateDurableJob(event.Job); err != nil {
+			return result, fmt.Errorf("invalid event job at %d: %w", offset, err)
+		}
 		result.Records++
 		result.LastSequence = sequence
+		result.Events = append(result.Events, event)
 		expected++
 		offset = end
 	}
 	return result, nil
+}
+
+func validateDurableJob(value job) error {
+	if value.ID == "" {
+		return errors.New("job id is empty")
+	}
+	if !durableRequestIDPattern.MatchString(value.Spec.RequestID) {
+		return errors.New("request_id is invalid")
+	}
+	if value.Spec.Manifest == "" || value.Spec.Destination == "" || value.Spec.Manifest == value.Spec.Destination {
+		return errors.New("job paths are invalid")
+	}
+	if value.Spec.MaxAttempts < 1 || value.Spec.MaxAttempts > 20 || value.Attempts < 0 || value.Attempts > value.Spec.MaxAttempts {
+		return errors.New("attempt counts are invalid")
+	}
+	if value.CreatedAt.IsZero() || value.UpdatedAt.IsZero() || value.UpdatedAt.Before(value.CreatedAt) {
+		return errors.New("job timestamps are invalid")
+	}
+	switch value.Status {
+	case "pending":
+		if value.Attempts != 0 || !value.CompletedAt.IsZero() {
+			return errors.New("pending job has attempts or completion time")
+		}
+	case "running", "retry_wait":
+		if value.Attempts < 1 || !value.CompletedAt.IsZero() {
+			return errors.New("nonterminal attempted job is invalid")
+		}
+	case "succeeded":
+		if value.Attempts < 1 || value.CompletedAt.IsZero() || value.ArtifactSize < 0 || len(value.ArtifactSHA) != 64 || value.ArtifactSHA != strings.ToLower(value.ArtifactSHA) {
+			return errors.New("succeeded job completion fields are invalid")
+		}
+		if _, err := hex.DecodeString(value.ArtifactSHA); err != nil {
+			return fmt.Errorf("succeeded job digest: %w", err)
+		}
+	case "failed":
+		if value.Attempts < 1 || value.CompletedAt.IsZero() {
+			return errors.New("failed job completion fields are invalid")
+		}
+	default:
+		return fmt.Errorf("unknown status %q", value.Status)
+	}
+	return nil
+}
+
+func sameDurableJob(left, right job) bool {
+	return left.ID == right.ID && left.Spec == right.Spec && left.Status == right.Status &&
+		left.Attempts == right.Attempts && left.LastError == right.LastError &&
+		left.ArtifactSize == right.ArtifactSize && left.ArtifactSHA == right.ArtifactSHA &&
+		left.CreatedAt.Equal(right.CreatedAt) && left.UpdatedAt.Equal(right.UpdatedAt) &&
+		left.CompletedAt.Equal(right.CompletedAt)
+}
+
+func replayDurableState(snapshot durableSnapshot, scan walScan) (map[string]job, error) {
+	jobs := make(map[string]job, len(snapshot.Jobs)+len(scan.Events))
+	requests := make(map[string]string, len(snapshot.Jobs)+len(scan.Events))
+	for id, value := range snapshot.Jobs {
+		jobs[id] = value
+		requests[value.Spec.RequestID] = id
+	}
+	for _, event := range scan.Events {
+		current := event.Job
+		previous, exists := jobs[current.ID]
+		if event.Type == "job_submitted" {
+			if exists || current.Status != "pending" || current.Attempts != 0 || !current.CompletedAt.IsZero() {
+				return nil, fmt.Errorf("invalid submitted event %d for job %q", event.Sequence, current.ID)
+			}
+			if existingID, duplicate := requests[current.Spec.RequestID]; duplicate && existingID != current.ID {
+				return nil, fmt.Errorf("event %d duplicates request_id %q", event.Sequence, current.Spec.RequestID)
+			}
+			requests[current.Spec.RequestID] = current.ID
+			jobs[current.ID] = current
+			continue
+		}
+		if !exists {
+			return nil, fmt.Errorf("event %d references unknown job %q", event.Sequence, current.ID)
+		}
+		if previous.Status == "succeeded" || previous.Status == "failed" {
+			return nil, fmt.Errorf("event %d follows terminal job %q", event.Sequence, current.ID)
+		}
+		if previous.Spec != current.Spec || !previous.CreatedAt.Equal(current.CreatedAt) || current.UpdatedAt.Before(previous.UpdatedAt) {
+			return nil, fmt.Errorf("event %d changes immutable or monotonic fields for job %q", event.Sequence, current.ID)
+		}
+		switch event.Type {
+		case "job_started":
+			if current.Status != "running" || current.Attempts != previous.Attempts+1 || !current.CompletedAt.IsZero() {
+				return nil, fmt.Errorf("event %d has invalid started transition", event.Sequence)
+			}
+		case "job_retry":
+			if previous.Status != "running" || current.Status != "retry_wait" || current.Attempts != previous.Attempts || !current.CompletedAt.IsZero() {
+				return nil, fmt.Errorf("event %d has invalid retry transition", event.Sequence)
+			}
+		case "job_succeeded":
+			if previous.Status != "running" || current.Status != "succeeded" || current.Attempts != previous.Attempts || current.CompletedAt.IsZero() {
+				return nil, fmt.Errorf("event %d has invalid success transition", event.Sequence)
+			}
+		case "job_failed":
+			if previous.Status != "running" || current.Status != "failed" || current.Attempts != previous.Attempts || current.CompletedAt.IsZero() {
+				return nil, fmt.Errorf("event %d has invalid failure transition", event.Sequence)
+			}
+		default:
+			return nil, fmt.Errorf("event %d has invalid type %q", event.Sequence, event.Type)
+		}
+		jobs[current.ID] = current
+	}
+	return jobs, nil
 }
 
 func directoryNames(path string) ([]string, error) {
@@ -717,16 +917,7 @@ func copyTree(source, destination string) error {
 	})
 }
 
-func fileDigest(path string) (string, []byte, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return "", nil, err
-	}
-	digest := sha256.Sum256(raw)
-	return hex.EncodeToString(digest[:]), raw, nil
-}
-
-func expectStartupFailure(binDir, configPath string, timeout time.Duration) (string, error) {
+func expectStartupFailure(binDir, configPath, address string, timeout time.Duration) (string, error) {
 	cmd := exec.Command(filepath.Join(binDir, "relayqd"), "-config", configPath)
 	var combined bytes.Buffer
 	cmd.Stdout = &combined
@@ -736,15 +927,35 @@ func expectStartupFailure(binDir, configPath string, timeout time.Duration) (str
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
-	select {
-	case err := <-done:
-		if err == nil {
-			return combined.String(), errors.New("relayqd unexpectedly exited zero on corrupt state")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			if err == nil {
+				return combined.String(), errors.New("relayqd unexpectedly exited zero on corrupt state")
+			}
+			return combined.String(), nil
+		default:
 		}
-		return combined.String(), nil
-	case <-time.After(timeout):
-		_ = cmd.Process.Kill()
-		<-done
-		return combined.String(), errors.New("relayqd remained running on corrupt state")
+		request, _ := http.NewRequest(http.MethodGet, "http://"+address+"/v1/health", nil)
+		request.Close = true
+		response, requestErr := (&http.Client{
+			Timeout:   20 * time.Millisecond,
+			Transport: &http.Transport{DisableKeepAlives: true},
+		}).Do(request)
+		if requestErr == nil {
+			raw, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+			_ = response.Body.Close()
+			var value health
+			if response.StatusCode == http.StatusOK && json.Unmarshal(raw, &value) == nil && value.Ready {
+				_ = cmd.Process.Kill()
+				<-done
+				return combined.String(), errors.New("relayqd reported ready on corrupt state")
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
+	_ = cmd.Process.Kill()
+	<-done
+	return combined.String(), errors.New("relayqd remained running on corrupt state")
 }

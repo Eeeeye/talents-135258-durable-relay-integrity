@@ -88,12 +88,8 @@ func (e *Engine) process(id string) {
 	job.LastError = ""
 	job.UpdatedAt = time.Now().UTC()
 	job.CompletedAt = job.UpdatedAt
-	if err := e.ledger.Append(model.NewReceipt(job)); err != nil {
-		e.handleAttemptFailure(job, fmt.Errorf("append receipt: %w", err))
-		return
-	}
-	if err := e.persist(model.EventSucceeded, job); err != nil {
-		e.failInMemory(id, fmt.Sprintf("persist success: %v", err))
+	if err := e.persistSucceeded(job); err != nil {
+		e.recordInMemoryError(id, fmt.Sprintf("persist success: %v", err))
 		return
 	}
 	e.metrics.Succeeded()
@@ -154,6 +150,17 @@ func (e *Engine) failInMemory(id, message string) {
 		job.LastError = message
 		job.UpdatedAt = time.Now().UTC()
 		job.CompletedAt = job.UpdatedAt
+		e.jobs[id] = job
+	}
+	e.stateMu.Unlock()
+}
+
+func (e *Engine) recordInMemoryError(id, message string) {
+	e.stateMu.Lock()
+	job, ok := e.jobs[id]
+	if ok {
+		job.LastError = message
+		job.UpdatedAt = time.Now().UTC()
 		e.jobs[id] = job
 	}
 	e.stateMu.Unlock()

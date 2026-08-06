@@ -7,12 +7,15 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
 	"example.com/durable-relay/internal/engine"
 	"example.com/durable-relay/internal/model"
 )
+
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 type Server struct {
 	engine *engine.Engine
@@ -119,9 +122,15 @@ func (s *Server) handleJobs(writer http.ResponseWriter, request *http.Request) {
 		}
 		writeJSON(writer, status, result)
 	case http.MethodGet:
-		requestID := request.URL.Query().Get("request_id")
-		if requestID == "" || len(request.URL.Query()) != 1 {
+		query := request.URL.Query()
+		values, exists := query["request_id"]
+		if !exists || len(query) != 1 || len(values) != 1 {
 			writeError(writer, http.StatusBadRequest, "invalid_query", "exactly one request_id query parameter is required")
+			return
+		}
+		requestID := strings.TrimSpace(values[0])
+		if !requestIDPattern.MatchString(requestID) {
+			writeError(writer, http.StatusBadRequest, "invalid_query", "request_id has invalid syntax")
 			return
 		}
 		writeJSON(writer, http.StatusOK, model.JobList{Jobs: s.engine.ListByRequest(requestID)})

@@ -29,6 +29,13 @@ Scaling down must not cancel already-running work; after that work completes,
 subsequent work must respect the lower limit. `/v1/stats` must report matching
 configured and active worker limits after the reload returns.
 
+`active_workers` is the number of publishers currently executing a job;
+`active_worker_limit` is the admission ceiling for new work. On a scale-down,
+the limit changes before reload returns. Existing in-flight publishers may
+therefore make `active_workers` temporarily exceed the new limit, but they must
+not be cancelled and no replacement work may enter until the count is below
+the new ceiling.
+
 Changing any restart-required field, or loading invalid/unknown/trailing JSON,
 must return HTTP 409 from the reload endpoint. A rejected reload must preserve
 the previous generation, published configuration, and runtime behavior.
@@ -52,6 +59,11 @@ job across restart.
 `sync_wal` retains its existing meaning for normal frame durability. Do not
 change the DRW1 header, event schema, snapshot schema, or filenames
 `events.wal` and `snapshot.json`.
+
+The jobs in `snapshot.json` and the typed job transitions in `events.wal` are
+the durable source of truth. Their contents must semantically reproduce the
+jobs and idempotency mappings returned after restart; an alternate sidecar
+state store cannot substitute for real snapshot jobs or real WAL transitions.
 
 ## 3. Fail closed on durable-state damage
 
@@ -95,6 +107,19 @@ the original unchanged. The key-to-job mapping must survive compaction and
 restart. A successfully completed logical job must have exactly one valid
 version-1 line in `receipts.jsonl`, including across concurrent duplicates,
 retries, and restart recovery.
+
+For this contract, normalized `manifest` and `destination` mean exactly the
+strings produced by the existing `JobSpec` validation: trim leading and
+trailing Unicode whitespace and perform no `filepath.Clean`, absolutization,
+symlink resolution, or case folding. The first valid submission is the first
+synchronous HTTP/`JobSpec` validation that is accepted with HTTP 202. A later
+asynchronous manifest or chunk publication failure still owns its
+`request_id`; a duplicate cannot replace that job's inputs.
+
+Termination at any point after artifact publication, including between the
+durable success and receipt writes, must recover without reclassifying the job
+as failed or producing a second receipt. After restart the job must converge to
+`succeeded` with exactly one receipt containing its durable completion values.
 
 ## 6. Preserve the public contract
 

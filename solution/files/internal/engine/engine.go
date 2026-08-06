@@ -99,6 +99,9 @@ func Open(manager *config.Manager) (OpenResult, error) {
 		if event.Sequence != lastSequence+1 {
 			return OpenResult{}, fmt.Errorf("WAL sequence %d does not follow durable sequence %d", event.Sequence, lastSequence)
 		}
+		if err := validateRecoveredTransition(jobs, event); err != nil {
+			return OpenResult{}, fmt.Errorf("validate recovered event %d: %w", event.Sequence, err)
+		}
 		if err := model.ApplyEvent(jobs, event); err != nil {
 			return OpenResult{}, fmt.Errorf("apply recovered event %d: %w", event.Sequence, err)
 		}
@@ -172,6 +175,57 @@ func Open(manager *config.Manager) (OpenResult, error) {
 	}, nil
 }
 
+func validateRecoveredTransition(jobs map[string]model.Job, event model.Event) error {
+	job := event.Job
+	previous, exists := jobs[job.ID]
+	if event.Type == model.EventSubmitted {
+		if exists {
+			return fmt.Errorf("submission replaces existing job %q", job.ID)
+		}
+		if job.Status != model.StatusPending || job.Attempts != 0 || !job.CompletedAt.IsZero() {
+			return fmt.Errorf("submission for job %q has status %q, attempts %d, or completion time", job.ID, job.Status, job.Attempts)
+		}
+		return nil
+	}
+	if !exists {
+		return fmt.Errorf("transition references unknown job %q", job.ID)
+	}
+	if previous.Terminal() {
+		return fmt.Errorf("transition follows terminal state %q for job %q", previous.Status, job.ID)
+	}
+	if previous.Spec != job.Spec || !previous.CreatedAt.Equal(job.CreatedAt) {
+		return fmt.Errorf("transition changes immutable fields for job %q", job.ID)
+	}
+	if job.UpdatedAt.Before(previous.UpdatedAt) {
+		return fmt.Errorf("transition moves updated_at backwards for job %q", job.ID)
+	}
+
+	switch event.Type {
+	case model.EventStarted:
+		if job.Status != model.StatusRunning || job.Attempts != previous.Attempts+1 || !job.CompletedAt.IsZero() {
+			return fmt.Errorf("invalid started transition for job %q", job.ID)
+		}
+	case model.EventRetry:
+		if previous.Status != model.StatusRunning || job.Status != model.StatusRetryWait || job.Attempts != previous.Attempts || !job.CompletedAt.IsZero() {
+			return fmt.Errorf("invalid retry transition for job %q", job.ID)
+		}
+	case model.EventSucceeded:
+		if previous.Status != model.StatusRunning || job.Status != model.StatusSucceeded || job.Attempts != previous.Attempts || job.CompletedAt.IsZero() || len(job.ArtifactSHA) != 64 {
+			return fmt.Errorf("invalid success transition for job %q", job.ID)
+		}
+		if _, err := hex.DecodeString(job.ArtifactSHA); err != nil {
+			return fmt.Errorf("invalid success digest for job %q: %w", job.ID, err)
+		}
+	case model.EventFailed:
+		if previous.Status != model.StatusRunning || job.Status != model.StatusFailed || job.Attempts != previous.Attempts || job.CompletedAt.IsZero() {
+			return fmt.Errorf("invalid failed transition for job %q", job.ID)
+		}
+	default:
+		return fmt.Errorf("unsupported event type %q", event.Type)
+	}
+	return nil
+}
+
 func (e *Engine) Submit(spec model.JobSpec) (model.SubmitResult, error) {
 	e.submitMu.Lock()
 	defer e.submitMu.Unlock()
@@ -219,16 +273,57 @@ func (e *Engine) persist(kind model.EventType, job model.Job) error {
 	if err := e.wal.AppendModel(&event); err != nil {
 		return err
 	}
+	e.publishPersisted(kind, job, event.Sequence)
+	return nil
+}
+
+// persistSucceeded commits the recoverable success state before materializing
+// its receipt. The in-memory success is published only after both durable
+// representations agree, so readers never observe a completed job without its
+// receipt. Startup reconciliation fills the one safe crash window: a durable
+// success frame whose receipt has not yet been appended.
+func (e *Engine) persistSucceeded(job model.Job) error {
+	e.durabilityMu.Lock()
+	defer e.durabilityMu.Unlock()
+
+	event := model.NewEvent(model.EventSucceeded, job, time.Now())
+	if err := e.wal.AppendModel(&event); err != nil {
+		return err
+	}
+	// A receipt is always synced. Sync the success frame first even when normal
+	// WAL writes are buffered so the receipt can never become the only durable
+	// evidence of completion.
+	if err := e.wal.Sync(); err != nil {
+		return fmt.Errorf("sync success event: %w", err)
+	}
+	receipt := model.NewReceipt(job)
+	for {
+		if err := e.ledger.Append(receipt); err == nil {
+			break
+		} else {
+			timer := time.NewTimer(50 * time.Millisecond)
+			select {
+			case <-e.ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("append success receipt: %w", err)
+			case <-timer.C:
+			}
+		}
+	}
+	e.publishPersisted(model.EventSucceeded, job, event.Sequence)
+	return nil
+}
+
+func (e *Engine) publishPersisted(kind model.EventType, job model.Job, sequence uint64) {
 	e.stateMu.Lock()
 	e.jobs[job.ID] = job.Clone()
 	if kind == model.EventSubmitted {
 		e.requests[job.Spec.RequestID] = job.ID
 	}
-	if event.Sequence > e.lastSequence {
-		e.lastSequence = event.Sequence
+	if sequence > e.lastSequence {
+		e.lastSequence = sequence
 	}
 	e.stateMu.Unlock()
-	return nil
 }
 
 func (e *Engine) enqueue(id string) error {

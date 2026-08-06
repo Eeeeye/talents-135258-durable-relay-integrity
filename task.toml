@@ -10,6 +10,7 @@ keywords = ["go", "durability", "wal", "concurrency", "idempotency", "atomic-fil
 difficulty = "L4"
 activity_id = "135258"
 source_sha256 = "872791c69307abb76f1b1facfa2b93da3c071a7a8d20eba5ff3712dd1ccf6a94"
+expert_time_estimate_min = 240.0
 
 [verifier]
 timeout_sec = 420.0

@@ -46,7 +46,9 @@ func main() {
 		run  func(*verifier) error
 	}{
 		{"ordinary-and-atomic-publication", testOrdinaryAndAtomicPublication},
+		{"strict-http-contract", testStrictHTTPContract},
 		{"durable-idempotency", testDurableIdempotency},
+		{"success-receipt-crash-recovery", testSuccessReceiptCrashRecovery},
 		{"transactional-live-reload", testTransactionalReload},
 		{"concurrent-wal-compaction-restart", testConcurrentWALCompaction},
 		{"corrupt-state-fails-closed", testCorruptionFailsClosed},
@@ -228,6 +230,167 @@ func testOrdinaryAndAtomicPublication(v *verifier) error {
 	return nil
 }
 
+func testStrictHTTPContract(v *verifier) error {
+	directory := filepath.Join(v.root, "strict http")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	cfg := baseConfig()
+	cfg.WorkerCount = 1
+	configPath, cfg, err := v.prepareConfig(directory, cfg)
+	if err != nil {
+		return err
+	}
+	svc, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs"))
+	if err != nil {
+		return err
+	}
+	defer svc.kill()
+
+	generated, err := v.makeFixture(directory, "strict fixture", [][]byte{v.bytes(97)})
+	if err != nil {
+		return err
+	}
+	destination := filepath.Join(directory, "archive", "strict.bin")
+	validOne := v.token("strict-unknown")
+	validTwo := v.token("strict-trailing")
+	validThree := v.token("strict-multiple")
+	invalidBodies := []struct {
+		name       string
+		body       []byte
+		statusCode int
+		errorCode  string
+	}{
+		{
+			name: "small unknown field",
+			body: []byte(fmt.Sprintf(`{"request_id":%q,"manifest":%q,"destination":%q,"unknown":true}`,
+				validOne, generated.Manifest, destination)),
+			statusCode: http.StatusBadRequest,
+			errorCode:  "invalid_json",
+		},
+		{
+			name: "trailing non JSON",
+			body: []byte(fmt.Sprintf(`{"request_id":%q,"manifest":%q,"destination":%q} trailing`,
+				validTwo, generated.Manifest, destination)),
+			statusCode: http.StatusBadRequest,
+			errorCode:  "invalid_json",
+		},
+		{
+			name: "multiple JSON values",
+			body: []byte(fmt.Sprintf(`{"request_id":%q,"manifest":%q,"destination":%q}{}`,
+				validThree, generated.Manifest, destination)),
+			statusCode: http.StatusBadRequest,
+			errorCode:  "invalid_json",
+		},
+		{
+			name:       "request id slash",
+			body:       []byte(fmt.Sprintf(`{"request_id":"bad/id","manifest":%q,"destination":%q}`, generated.Manifest, destination)),
+			statusCode: http.StatusBadRequest,
+			errorCode:  "invalid_job",
+		},
+		{
+			name:       "request id leading punctuation",
+			body:       []byte(fmt.Sprintf(`{"request_id":"-bad","manifest":%q,"destination":%q}`, generated.Manifest, destination)),
+			statusCode: http.StatusBadRequest,
+			errorCode:  "invalid_job",
+		},
+		{
+			name:       "request id too long",
+			body:       []byte(fmt.Sprintf(`{"request_id":%q,"manifest":%q,"destination":%q}`, strings.Repeat("a", 129), generated.Manifest, destination)),
+			statusCode: http.StatusBadRequest,
+			errorCode:  "invalid_job",
+		},
+	}
+	for _, item := range invalidBodies {
+		before, err := svc.readStats()
+		if err != nil {
+			return err
+		}
+		status, raw, err := svc.requestRaw(http.MethodPost, "/v1/jobs", "application/json", item.body)
+		if err != nil {
+			return fmt.Errorf("%s request: %w", item.name, err)
+		}
+		if err := expectHTTPError(item.name, status, raw, item.statusCode, item.errorCode); err != nil {
+			return err
+		}
+		after, err := svc.readStats()
+		if err != nil {
+			return err
+		}
+		if after.Runtime.Accepted != before.Runtime.Accepted || after.LastSequence != before.LastSequence {
+			return fmt.Errorf("%s created a job: before=%+v after=%+v", item.name, before, after)
+		}
+	}
+
+	queryCases := []struct {
+		name string
+		path string
+	}{
+		{"missing request id", "/v1/jobs"},
+		{"empty request id", "/v1/jobs?request_id="},
+		{"duplicate request id", "/v1/jobs?request_id=one&request_id=two"},
+		{"extra query field", "/v1/jobs?request_id=one&other=two"},
+		{"invalid request id", "/v1/jobs?request_id=bad%2Fid"},
+	}
+	for _, item := range queryCases {
+		status, raw, err := svc.requestRaw(http.MethodGet, item.path, "", nil)
+		if err != nil {
+			return fmt.Errorf("%s query: %w", item.name, err)
+		}
+		if err := expectHTTPError(item.name, status, raw, http.StatusBadRequest, "invalid_query"); err != nil {
+			return err
+		}
+	}
+
+	methodCases := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/v1/health"},
+		{http.MethodPost, "/v1/stats"},
+		{http.MethodDelete, "/v1/jobs"},
+		{http.MethodPost, "/v1/jobs/not-present"},
+		{http.MethodGet, "/v1/admin/reload"},
+		{http.MethodGet, "/v1/admin/compact"},
+	}
+	for _, item := range methodCases {
+		label := item.method + " " + item.path
+		status, raw, err := svc.requestRaw(item.method, item.path, "", nil)
+		if err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		if err := expectHTTPError(label, status, raw, http.StatusMethodNotAllowed, "method_not_allowed"); err != nil {
+			return err
+		}
+	}
+	for label, path := range map[string]string{
+		"unknown route":  "/v1/not-present",
+		"traversal path": "/v1/jobs/%2e%2e%2fsecret",
+	} {
+		status, raw, err := svc.requestRaw(http.MethodGet, path, "", nil)
+		if err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		if err := expectHTTPError(label, status, raw, http.StatusNotFound, "not_found"); err != nil {
+			return err
+		}
+	}
+
+	if err := svc.stop(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func expectHTTPError(label string, status int, raw []byte, expectedStatus int, expectedCode string) error {
+	var envelope errorEnvelope
+	decodeErr := json.Unmarshal(raw, &envelope)
+	if status != expectedStatus || decodeErr != nil || envelope.Error.Code != expectedCode || envelope.Error.Message == "" {
+		return fmt.Errorf("%s status=%d code=%q decode=%v body=%s", label, status, envelope.Error.Code, decodeErr, strings.TrimSpace(string(raw)))
+	}
+	return nil
+}
+
 func testDurableIdempotency(v *verifier) error {
 	directory := filepath.Join(v.root, "durable idempotency")
 	if err := os.MkdirAll(directory, 0o700); err != nil {
@@ -386,10 +549,191 @@ func testDurableIdempotency(v *verifier) error {
 	return nil
 }
 
+func testSuccessReceiptCrashRecovery(v *verifier) error {
+	directory := filepath.Join(v.root, "success receipt crash")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	cfg := baseConfig()
+	cfg.WorkerCount = 1
+	cfg.MaxAttempts = 2
+	cfg.SyncWAL = true
+	configPath, cfg, err := v.prepareConfig(directory, cfg)
+	if err != nil {
+		return err
+	}
+	svc, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-one"))
+	if err != nil {
+		return err
+	}
+	defer svc.kill()
+
+	payload := v.bytes(1)
+	generated, fifoPath, err := v.makeFIFOFixture(directory, "crash fixture", payload)
+	if err != nil {
+		return err
+	}
+	spec := jobSpec{
+		RequestID: v.token("receipt-crash"), Manifest: generated.Manifest,
+		Destination: filepath.Join(directory, "archive", "crash-safe.bin"), MaxAttempts: 2,
+	}
+	status, submitted, raw, err := svc.submit(spec)
+	if err != nil || status != http.StatusAccepted || submitted.Job.ID == "" {
+		return fmt.Errorf("crash-window submit status=%d result=%+v err=%v body=%s", status, submitted, err, strings.TrimSpace(string(raw)))
+	}
+	writerResult := make(chan fifoOpenResult, 1)
+	go func() {
+		file, openErr := os.OpenFile(fifoPath, os.O_WRONLY, 0)
+		writerResult <- fifoOpenResult{path: fifoPath, file: file, err: openErr}
+	}()
+	var fifoWriter *os.File
+	select {
+	case opened := <-writerResult:
+		if opened.err != nil {
+			return opened.err
+		}
+		fifoWriter = opened.file
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("publisher did not enter the controlled crash fixture")
+	}
+	walInfo, err := os.Stat(filepath.Join(cfg.StateDir, "events.wal"))
+	if err != nil {
+		_ = fifoWriter.Close()
+		return err
+	}
+	if walInfo.Size() < 1024 {
+		_ = fifoWriter.Close()
+		return fmt.Errorf("pre-success WAL is too small for safe failure injection: %d", walInfo.Size())
+	}
+	if err := setProcessFileSizeLimit(svc.cmd.Process.Pid, uint64(walInfo.Size())); err != nil {
+		_ = fifoWriter.Close()
+		return fmt.Errorf("limit next durable write: %w", err)
+	}
+	if _, err := fifoWriter.Write(payload); err != nil {
+		_ = fifoWriter.Close()
+		return err
+	}
+	if err := fifoWriter.Close(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		observed, readErr := os.ReadFile(spec.Destination)
+		if readErr == nil && bytes.Equal(observed, payload) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	observed, err := os.ReadFile(spec.Destination)
+	if err != nil || !bytes.Equal(observed, payload) {
+		return fmt.Errorf("artifact was not published before injected termination: bytes=%d err=%v", len(observed), err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	svc.kill()
+
+	address, err := reserveAddress()
+	if err != nil {
+		return err
+	}
+	cfg.Listen = address
+	if err := writeJSON(configPath, cfg); err != nil {
+		return err
+	}
+	restarted, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-two"))
+	if err != nil {
+		return fmt.Errorf("restart after receipt-edge kill: %w", err)
+	}
+	defer restarted.kill()
+	restartWriter := make(chan fifoOpenResult, 1)
+	go func() {
+		file, openErr := os.OpenFile(fifoPath, os.O_WRONLY, 0)
+		restartWriter <- fifoOpenResult{path: fifoPath, file: file, err: openErr}
+	}()
+	select {
+	case opened := <-restartWriter:
+		if opened.err != nil {
+			return opened.err
+		}
+		if _, err := opened.file.Write(payload); err != nil {
+			_ = opened.file.Close()
+			return err
+		}
+		if err := opened.file.Close(); err != nil {
+			return err
+		}
+	case <-time.After(2 * time.Second):
+		return fmt.Errorf("recovered attempt did not reopen controlled fixture")
+	}
+	recovered, err := waitTerminal(restarted, submitted.Job.ID, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if recovered.Status != "succeeded" || recovered.Attempts != 2 || recovered.ArtifactSHA != generated.ArtifactSHA {
+		return fmt.Errorf("receipt-edge recovery changed successful job: %+v", recovered)
+	}
+	jobs, err := restarted.listByRequest(spec.RequestID)
+	if err != nil || len(jobs) != 1 || jobs[0].ID != submitted.Job.ID {
+		return fmt.Errorf("receipt-edge recovery changed identity: jobs=%+v err=%v", jobs, err)
+	}
+	receipts, err := readReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"))
+	if err != nil {
+		return err
+	}
+	count := 0
+	for _, value := range receipts {
+		if value.RequestID == spec.RequestID {
+			count++
+			if value.JobID != submitted.Job.ID || value.ArtifactSHA256 != generated.ArtifactSHA || !value.CompletedAt.Equal(recovered.CompletedAt) {
+				return fmt.Errorf("receipt-edge receipt differs from recovered success: receipt=%+v job=%+v", value, recovered)
+			}
+		}
+	}
+	if count != 1 {
+		return fmt.Errorf("receipt-edge recovery produced %d receipts", count)
+	}
+	if err := restarted.stop(); err != nil {
+		return err
+	}
+	return nil
+}
+
 type fifoOpenResult struct {
 	path string
 	file *os.File
 	err  error
+}
+
+func assertRejectedReload(svc *service, configPath, label string, candidate []byte) error {
+	original, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	before, err := svc.readStats()
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(configPath, candidate, 0o600); err != nil {
+		return err
+	}
+	status, raw, requestErr := svc.requestJSON(http.MethodPost, "/v1/admin/reload", nil)
+	restoreErr := os.WriteFile(configPath, original, 0o600)
+	if restoreErr != nil {
+		return fmt.Errorf("%s restore config: %w", label, restoreErr)
+	}
+	if requestErr != nil || status != http.StatusConflict {
+		return fmt.Errorf("%s reload status=%d err=%v body=%s", label, status, requestErr, strings.TrimSpace(string(raw)))
+	}
+	if err := expectHTTPError(label, status, raw, http.StatusConflict, "reload_rejected"); err != nil {
+		return err
+	}
+	after, err := svc.readStats()
+	if err != nil {
+		return err
+	}
+	if after.Config != before.Config || after.Runtime != before.Runtime || after.LastSequence != before.LastSequence {
+		return fmt.Errorf("%s changed published state: before=%+v after=%+v", label, before, after)
+	}
+	return nil
 }
 
 func testTransactionalReload(v *verifier) error {
@@ -411,26 +755,69 @@ func testTransactionalReload(v *verifier) error {
 	}
 	defer svc.kill()
 
-	rejected := cfg
-	rejected.SyncWAL = !cfg.SyncWAL
-	if err := writeJSON(configPath, rejected); err != nil {
+	alternateListen, err := reserveAddress()
+	if err != nil {
 		return err
 	}
-	status, raw, err := svc.requestJSON(http.MethodPost, "/v1/admin/reload", nil)
-	if err != nil || status != http.StatusConflict {
-		return fmt.Errorf("restart-required reload status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	marshalConfig := func(value configFile) []byte {
+		raw, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			panic(marshalErr)
+		}
+		return raw
+	}
+	validRaw := marshalConfig(cfg)
+	unknownRaw := append([]byte(nil), validRaw[:len(validRaw)-1]...)
+	unknownRaw = append(unknownRaw, []byte(`,"unexpected":true}`)...)
+	trailingRaw := append(append([]byte(nil), validRaw...), []byte(` {}`)...)
+	rejectedCases := []struct {
+		name string
+		cfg  configFile
+		raw  []byte
+	}{
+		{name: "listen", cfg: cfg},
+		{name: "state_dir", cfg: cfg},
+		{name: "queue_capacity", cfg: cfg},
+		{name: "sync_wal", cfg: cfg},
+		{name: "snapshot_interval_ms", cfg: cfg},
+		{name: "shutdown_timeout_ms", cfg: cfg},
+		{name: "invalid live value", cfg: cfg},
+		{name: "malformed JSON", raw: []byte(`{"listen":`)},
+		{name: "unknown field", raw: unknownRaw},
+		{name: "trailing JSON", raw: trailingRaw},
+	}
+	rejectedCases[0].cfg.Listen = alternateListen
+	rejectedCases[1].cfg.StateDir = filepath.Join(directory, "different state")
+	rejectedCases[2].cfg.QueueCapacity++
+	rejectedCases[3].cfg.SyncWAL = !cfg.SyncWAL
+	rejectedCases[4].cfg.SnapshotIntervalMS = 50
+	rejectedCases[5].cfg.ShutdownTimeoutMS++
+	rejectedCases[6].cfg.WorkerCount = 0
+	for _, item := range rejectedCases {
+		raw := item.raw
+		if raw == nil {
+			raw = marshalConfig(item.cfg)
+		}
+		if err := assertRejectedReload(svc, configPath, item.name, raw); err != nil {
+			return err
+		}
 	}
 	before, err := svc.readStats()
 	if err != nil {
 		return err
 	}
-	if before.Config.Generation != 1 || before.Config.SyncWAL != cfg.SyncWAL || before.Runtime.ActiveWorkerLimit != 1 {
-		return fmt.Errorf("rejected reload changed state: %+v", before)
+	if before.Config.Generation != 1 || before.Config != (configSnapshot{Generation: 1, configFile: cfg}) || before.Runtime.ActiveWorkerLimit != 1 {
+		return fmt.Errorf("rejected reload matrix changed baseline: %+v", before)
 	}
 
 	firstPayload := v.bytes(32771)
 	secondPayload := v.bytes(24593)
+	thirdPayload := v.bytes(19301)
 	firstFixture, firstFIFO, err := v.makeFIFOFixture(directory, "fifo first", firstPayload)
+	if err != nil {
+		return err
+	}
+	thirdFixture, thirdFIFO, err := v.makeFIFOFixture(directory, "fifo third", thirdPayload)
 	if err != nil {
 		return err
 	}
@@ -453,7 +840,7 @@ func testTransactionalReload(v *verifier) error {
 		return fmt.Errorf("second fifo submit status=%d err=%v body=%s", secondStatus, err, strings.TrimSpace(string(raw)))
 	}
 
-	openResults := make(chan fifoOpenResult, 2)
+	openResults := make(chan fifoOpenResult, 3)
 	for _, path := range []string{firstFIFO, secondFIFO} {
 		go func(path string) {
 			file, openErr := os.OpenFile(path, os.O_WRONLY, 0)
@@ -481,13 +868,13 @@ func testTransactionalReload(v *verifier) error {
 
 	updated := cfg
 	updated.WorkerCount = 2
-	updated.RetryBaseMS = 250
+	updated.RetryBaseMS = 150
 	updated.MaxAttempts = 4
 	updated.MaxRequestBytes = 4096
 	if err := writeJSON(configPath, updated); err != nil {
 		return err
 	}
-	status, raw, err = svc.requestJSON(http.MethodPost, "/v1/admin/reload", nil)
+	status, raw, err := svc.requestJSON(http.MethodPost, "/v1/admin/reload", nil)
 	if err != nil || status != http.StatusOK {
 		return fmt.Errorf("mutable reload status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
 	}
@@ -504,21 +891,87 @@ func testTransactionalReload(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	if after.Config.Generation != 2 || after.Config.WorkerCount != 2 || after.Config.RetryBaseMS != 250 ||
+	if after.Config.Generation != 2 || after.Config.WorkerCount != 2 || after.Config.RetryBaseMS != 150 ||
 		after.Config.MaxAttempts != 4 || after.Config.MaxRequestBytes != 4096 || after.Runtime.ActiveWorkerLimit != 2 {
 		return fmt.Errorf("mutable reload not coherent: %+v", after)
 	}
-	payloads := map[string][]byte{firstFIFO: firstPayload, secondFIFO: secondPayload}
-	for _, result := range opened {
+
+	scaledDown := updated
+	scaledDown.WorkerCount = 1
+	if err := writeJSON(configPath, scaledDown); err != nil {
+		return err
+	}
+	status, raw, err = svc.requestJSON(http.MethodPost, "/v1/admin/reload", nil)
+	if err != nil || status != http.StatusOK {
+		return fmt.Errorf("scale-down reload status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	}
+	downStats, err := svc.readStats()
+	if err != nil {
+		return err
+	}
+	if downStats.Config.Generation != 3 || downStats.Config.WorkerCount != 1 || downStats.Runtime.ActiveWorkerLimit != 1 || downStats.Runtime.ActiveWorkers != 2 {
+		return fmt.Errorf("scale-down state is not immediate and non-cancelling: %+v", downStats)
+	}
+	thirdStatus, thirdSubmit, raw, err := svc.submit(jobSpec{
+		RequestID: v.token("fifo-three"), Manifest: thirdFixture.Manifest,
+		Destination: filepath.Join(directory, "fifo archive", "three.bin"), MaxAttempts: 1,
+	})
+	if err != nil || thirdStatus != http.StatusAccepted {
+		return fmt.Errorf("third fifo submit status=%d err=%v body=%s", thirdStatus, err, strings.TrimSpace(string(raw)))
+	}
+	go func() {
+		file, openErr := os.OpenFile(thirdFIFO, os.O_WRONLY, 0)
+		openResults <- fifoOpenResult{path: thirdFIFO, file: file, err: openErr}
+	}()
+	select {
+	case result := <-openResults:
+		if result.file != nil {
+			_ = result.file.Close()
+		}
+		return fmt.Errorf("scale-down admitted replacement while two publishers remained active: path=%s err=%v", result.path, result.err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	payloads := map[string][]byte{firstFIFO: firstPayload, secondFIFO: secondPayload, thirdFIFO: thirdPayload}
+	jobIDs := map[string]string{firstFIFO: firstSubmit.Job.ID, secondFIFO: secondSubmit.Job.ID, thirdFIFO: thirdSubmit.Job.ID}
+	release := func(result fifoOpenResult) error {
 		if _, err := result.file.Write(payloads[result.path]); err != nil {
 			_ = result.file.Close()
 			return err
 		}
-		if err := result.file.Close(); err != nil {
-			return err
-		}
+		return result.file.Close()
 	}
-	for _, id := range []string{firstSubmit.Job.ID, secondSubmit.Job.ID} {
+	if err := release(opened[0]); err != nil {
+		return err
+	}
+	firstCompleted, err := waitTerminal(svc, jobIDs[opened[0].path], 5*time.Second)
+	if err != nil || firstCompleted.Status != "succeeded" {
+		return fmt.Errorf("first released in-flight job was cancelled: job=%+v err=%v", firstCompleted, err)
+	}
+	select {
+	case result := <-openResults:
+		if result.file != nil {
+			_ = result.file.Close()
+		}
+		return fmt.Errorf("new work entered while active_workers equaled the reduced limit: path=%s err=%v", result.path, result.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := release(opened[1]); err != nil {
+		return err
+	}
+	var thirdOpened fifoOpenResult
+	select {
+	case thirdOpened = <-openResults:
+		if thirdOpened.err != nil || thirdOpened.path != thirdFIFO {
+			return fmt.Errorf("unexpected third FIFO open: %+v", thirdOpened)
+		}
+	case <-time.After(2 * time.Second):
+		return fmt.Errorf("reduced worker limit did not admit queued work after both old publishers completed")
+	}
+	if err := release(thirdOpened); err != nil {
+		return err
+	}
+	for _, id := range []string{firstSubmit.Job.ID, secondSubmit.Job.ID, thirdSubmit.Job.ID} {
 		value, err := waitTerminal(svc, id, 5*time.Second)
 		if err != nil {
 			return err
@@ -552,15 +1005,15 @@ func testTransactionalReload(v *verifier) error {
 	if retrying.Spec.MaxAttempts != 4 {
 		return fmt.Errorf("new default max_attempts not applied: %+v", retrying.Spec)
 	}
+	retryStarted := time.Now()
 	if err := os.WriteFile(retryFixture.ChunkPaths[0], retryData, 0o600); err != nil {
 		return err
 	}
-	retryStarted := time.Now()
-	retried, err := waitTerminal(svc, retrySubmit.Job.ID, 850*time.Millisecond)
+	retried, err := waitTerminal(svc, retrySubmit.Job.ID, 450*time.Millisecond)
 	if err != nil {
-		return fmt.Errorf("new retry_base_ms was not live within 850ms: %w", err)
+		return fmt.Errorf("new retry_base_ms was not live within 450ms: %w", err)
 	}
-	if retried.Status != "succeeded" || time.Since(retryStarted) >= 850*time.Millisecond {
+	if retried.Status != "succeeded" || time.Since(retryStarted) >= 450*time.Millisecond {
 		return fmt.Errorf("retried job mismatch: %+v elapsed=%s", retried, time.Since(retryStarted))
 	}
 
@@ -658,23 +1111,61 @@ func testConcurrentWALCompaction(v *verifier) error {
 			return fmt.Errorf("bulk job %d completion=%+v", index, completed)
 		}
 	}
+	sentinelRequest := v.token("post-compact-sentinel")
+	sentinelStatus, sentinelSubmit, raw, err := svc.submit(jobSpec{
+		RequestID: sentinelRequest, Manifest: generated.Manifest,
+		Destination: filepath.Join(directory, "bulk archive", sentinelRequest+".bin"), MaxAttempts: 2,
+	})
+	if err != nil || sentinelStatus != http.StatusAccepted || sentinelSubmit.Job.ID == "" {
+		return fmt.Errorf("post-compact sentinel status=%d err=%v body=%s", sentinelStatus, err, strings.TrimSpace(string(raw)))
+	}
+	sentinelCompleted, err := waitTerminal(svc, sentinelSubmit.Job.ID, 8*time.Second)
+	if err != nil || sentinelCompleted.Status != "succeeded" {
+		return fmt.Errorf("post-compact sentinel completion=%+v err=%v", sentinelCompleted, err)
+	}
 	if err := svc.stop(); err != nil {
 		return err
 	}
 
-	snapshotLast, err := readSnapshotLast(filepath.Join(cfg.StateDir, "snapshot.json"))
+	snapshot, exists, err := readSnapshot(filepath.Join(cfg.StateDir, "snapshot.json"))
 	if err != nil {
 		return fmt.Errorf("independent snapshot parse: %w", err)
 	}
-	if snapshotLast == 0 {
+	if !exists || snapshot.LastSequence == 0 {
 		return fmt.Errorf("concurrent explicit compaction did not produce a nonempty snapshot")
 	}
-	scan, err := scanWAL(filepath.Join(cfg.StateDir, "events.wal"), snapshotLast)
+	scan, err := scanWAL(filepath.Join(cfg.StateDir, "events.wal"), snapshot.LastSequence)
 	if err != nil {
 		return fmt.Errorf("independent WAL scan after concurrent compaction: %w", err)
 	}
-	if scan.LastSequence < snapshotLast {
-		return fmt.Errorf("WAL/snapshot sequence regressed: snapshot=%d scan=%+v", snapshotLast, scan)
+	if scan.LastSequence < snapshot.LastSequence {
+		return fmt.Errorf("WAL/snapshot sequence regressed: snapshot=%d scan=%+v", snapshot.LastSequence, scan)
+	}
+	durableJobs, err := replayDurableState(snapshot, scan)
+	if err != nil {
+		return fmt.Errorf("semantic durable-state replay: %w", err)
+	}
+	if len(durableJobs) != count+1 {
+		return fmt.Errorf("durable state contains %d jobs, expected %d", len(durableJobs), count+1)
+	}
+	for index, outcome := range outcomes {
+		value, ok := durableJobs[outcome.jobID]
+		if !ok || value.Spec.RequestID != outcome.requestID || value.Status != "succeeded" || value.ArtifactSHA != generated.ArtifactSHA {
+			return fmt.Errorf("durable bulk job %d is not represented by real state: %+v ok=%v", index, value, ok)
+		}
+	}
+	value, ok := durableJobs[sentinelSubmit.Job.ID]
+	if !ok || value.Spec.RequestID != sentinelRequest || value.Status != "succeeded" || value.ArtifactSHA != generated.ArtifactSHA {
+		return fmt.Errorf("post-compact sentinel is absent from durable state: %+v ok=%v", value, ok)
+	}
+	var sentinelTransitions []string
+	for _, event := range scan.Events {
+		if event.Job.ID == sentinelSubmit.Job.ID {
+			sentinelTransitions = append(sentinelTransitions, event.Type)
+		}
+	}
+	if strings.Join(sentinelTransitions, ",") != "job_submitted,job_started,job_succeeded" {
+		return fmt.Errorf("post-compact WAL does not contain real typed transitions: %v", sentinelTransitions)
 	}
 
 	address, err := reserveAddress()
@@ -692,9 +1183,14 @@ func testConcurrentWALCompaction(v *verifier) error {
 	defer restarted.kill()
 	for index, outcome := range outcomes {
 		jobs, err := restarted.listByRequest(outcome.requestID)
-		if err != nil || len(jobs) != 1 || jobs[0].ID != outcome.jobID || jobs[0].Status != "succeeded" {
+		durable := durableJobs[outcome.jobID]
+		if err != nil || len(jobs) != 1 || jobs[0].ID != outcome.jobID || !sameDurableJob(jobs[0], durable) {
 			return fmt.Errorf("recovered bulk request %d jobs=%+v err=%v", index, jobs, err)
 		}
+	}
+	sentinelJobs, err := restarted.listByRequest(sentinelRequest)
+	if err != nil || len(sentinelJobs) != 1 || !sameDurableJob(sentinelJobs[0], durableJobs[sentinelSubmit.Job.ID]) {
+		return fmt.Errorf("recovered sentinel jobs=%+v err=%v", sentinelJobs, err)
 	}
 	receipts, err := readReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"))
 	if err != nil {
@@ -708,6 +1204,9 @@ func testConcurrentWALCompaction(v *verifier) error {
 		if seen[outcome.requestID] != 1 {
 			return fmt.Errorf("bulk request %d receipt count=%d", index, seen[outcome.requestID])
 		}
+	}
+	if seen[sentinelRequest] != 1 {
+		return fmt.Errorf("sentinel receipt count=%d", seen[sentinelRequest])
 	}
 	if err := restarted.stop(); err != nil {
 		return err
@@ -747,27 +1246,209 @@ func testCorruptionFailsClosed(v *verifier) error {
 	if err != nil || completed.Status != "succeeded" {
 		return fmt.Errorf("corruption source completion=%+v err=%v", completed, err)
 	}
+	status, raw, err = svc.requestJSON(http.MethodPost, "/v1/admin/compact", nil)
+	if err != nil || status != http.StatusOK {
+		return fmt.Errorf("corruption source compact status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	}
+	secondRequest := v.token("corruption-post-snapshot")
+	status, secondSubmit, raw, err := svc.submit(jobSpec{
+		RequestID: secondRequest, Manifest: generated.Manifest,
+		Destination: filepath.Join(directory, "archive", "post-snapshot.bin"), MaxAttempts: 1,
+	})
+	if err != nil || status != http.StatusAccepted {
+		return fmt.Errorf("post-snapshot source submit status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	}
+	secondCompleted, err := waitTerminal(svc, secondSubmit.Job.ID, 5*time.Second)
+	if err != nil || secondCompleted.Status != "succeeded" {
+		return fmt.Errorf("post-snapshot source completion=%+v err=%v", secondCompleted, err)
+	}
 	if err := svc.stop(); err != nil {
 		return err
 	}
 	sourceWAL := filepath.Join(cfg.StateDir, "events.wal")
-	_, original, err := fileDigest(sourceWAL)
+	originalWAL, err := os.ReadFile(sourceWAL)
 	if err != nil {
 		return err
 	}
-	if len(original) < 32 {
-		return fmt.Errorf("source WAL unexpectedly short: %d", len(original))
+	sourceSnapshot := filepath.Join(cfg.StateDir, "snapshot.json")
+	originalSnapshot, err := os.ReadFile(sourceSnapshot)
+	if err != nil {
+		return err
+	}
+	frames, err := parseRawWALFrames(originalWAL)
+	if err != nil || len(frames) < 3 {
+		return fmt.Errorf("source WAL frames=%d err=%v", len(frames), err)
+	}
+	baseSnapshot, exists, err := readSnapshot(sourceSnapshot)
+	if err != nil || !exists || baseSnapshot.LastSequence == 0 {
+		return fmt.Errorf("source snapshot invalid: exists=%v snapshot=%+v err=%v", exists, baseSnapshot, err)
 	}
 
-	cases := []struct {
+	rewriteEvent := func(index int, mutate func(*durableEvent)) ([]byte, error) {
+		copyOfFrames := cloneRawWALFrames(frames)
+		var event durableEvent
+		if err := json.Unmarshal(copyOfFrames[index].Payload, &event); err != nil {
+			return nil, err
+		}
+		mutate(&event)
+		payload, err := json.Marshal(event)
+		if err != nil {
+			return nil, err
+		}
+		copyOfFrames[index].Payload = payload
+		return encodeRawWALFrames(copyOfFrames), nil
+	}
+	rewriteSnapshot := func(mutate func(*durableSnapshot)) ([]byte, error) {
+		var value durableSnapshot
+		if err := json.Unmarshal(originalSnapshot, &value); err != nil {
+			return nil, err
+		}
+		mutate(&value)
+		return json.Marshal(value)
+	}
+	type damageCase struct {
 		name   string
-		mutate func([]byte) []byte
-	}{
-		{"truncated-payload", func(raw []byte) []byte { return append([]byte(nil), raw[:len(raw)-7]...) }},
-		{"checksum-damage", func(raw []byte) []byte {
-			copyOfRaw := append([]byte(nil), raw...)
-			copyOfRaw[len(copyOfRaw)-1] ^= 0x40
-			return copyOfRaw
+		mutate func([]byte, []byte) ([]byte, []byte, error)
+	}
+	cases := []damageCase{
+		{name: "partial-header", mutate: func(walRaw, snapshotRaw []byte) ([]byte, []byte, error) {
+			return append([]byte(nil), walRaw[:11]...), snapshotRaw, nil
+		}},
+		{name: "bad-magic", mutate: func(walRaw, snapshotRaw []byte) ([]byte, []byte, error) {
+			result := append([]byte(nil), walRaw...)
+			result[0] ^= 0x20
+			return result, snapshotRaw, nil
+		}},
+		{name: "bad-version", mutate: func(walRaw, snapshotRaw []byte) ([]byte, []byte, error) {
+			result := append([]byte(nil), walRaw...)
+			binary.LittleEndian.PutUint16(result[4:6], 2)
+			return result, snapshotRaw, nil
+		}},
+		{name: "bad-flags", mutate: func(walRaw, snapshotRaw []byte) ([]byte, []byte, error) {
+			result := append([]byte(nil), walRaw...)
+			binary.LittleEndian.PutUint16(result[6:8], 1)
+			return result, snapshotRaw, nil
+		}},
+		{name: "zero-length", mutate: func(walRaw, snapshotRaw []byte) ([]byte, []byte, error) {
+			result := append([]byte(nil), walRaw...)
+			binary.LittleEndian.PutUint32(result[8:12], 0)
+			return result, snapshotRaw, nil
+		}},
+		{name: "oversized-length", mutate: func(walRaw, snapshotRaw []byte) ([]byte, []byte, error) {
+			result := append([]byte(nil), walRaw...)
+			binary.LittleEndian.PutUint32(result[8:12], (4<<20)+1)
+			return result, snapshotRaw, nil
+		}},
+		{name: "zero-sequence", mutate: func(walRaw, snapshotRaw []byte) ([]byte, []byte, error) {
+			result := append([]byte(nil), walRaw...)
+			binary.LittleEndian.PutUint64(result[16:24], 0)
+			return result, snapshotRaw, nil
+		}},
+		{name: "truncated-payload", mutate: func(_ []byte, snapshotRaw []byte) ([]byte, []byte, error) {
+			end := 24 + len(frames[0].Payload) - 1
+			return append([]byte(nil), originalWAL[:end]...), snapshotRaw, nil
+		}},
+		{name: "checksum-damage", mutate: func(walRaw, snapshotRaw []byte) ([]byte, []byte, error) {
+			result := append([]byte(nil), walRaw...)
+			result[24+len(frames[0].Payload)/2] ^= 0x40
+			return result, snapshotRaw, nil
+		}},
+		{name: "malformed-event-json", mutate: func(_ []byte, snapshotRaw []byte) ([]byte, []byte, error) {
+			copyOfFrames := cloneRawWALFrames(frames)
+			copyOfFrames[0].Payload = bytes.Repeat([]byte{'x'}, len(copyOfFrames[0].Payload))
+			return encodeRawWALFrames(copyOfFrames), snapshotRaw, nil
+		}},
+		{name: "unknown-event-field", mutate: func(_ []byte, snapshotRaw []byte) ([]byte, []byte, error) {
+			copyOfFrames := cloneRawWALFrames(frames)
+			payload := copyOfFrames[0].Payload
+			payload = append(append([]byte(nil), payload[:len(payload)-1]...), []byte(`,"unexpected":true}`)...)
+			copyOfFrames[0].Payload = payload
+			return encodeRawWALFrames(copyOfFrames), snapshotRaw, nil
+		}},
+		{name: "trailing-event-json", mutate: func(_ []byte, snapshotRaw []byte) ([]byte, []byte, error) {
+			copyOfFrames := cloneRawWALFrames(frames)
+			copyOfFrames[0].Payload = append(copyOfFrames[0].Payload, []byte(`{}`)...)
+			return encodeRawWALFrames(copyOfFrames), snapshotRaw, nil
+		}},
+		{name: "header-payload-sequence-mismatch", mutate: func(_ []byte, snapshotRaw []byte) ([]byte, []byte, error) {
+			result, err := rewriteEvent(0, func(event *durableEvent) { event.Sequence++ })
+			return result, snapshotRaw, err
+		}},
+		{name: "snapshot-relative-gap", mutate: func(_ []byte, snapshotRaw []byte) ([]byte, []byte, error) {
+			copyOfFrames := cloneRawWALFrames(frames)
+			newSequence := binary.LittleEndian.Uint64(copyOfFrames[0].Header[16:24]) + 1
+			binary.LittleEndian.PutUint64(copyOfFrames[0].Header[16:24], newSequence)
+			var event durableEvent
+			if err := json.Unmarshal(copyOfFrames[0].Payload, &event); err != nil {
+				return nil, nil, err
+			}
+			event.Sequence = newSequence
+			payload, err := json.Marshal(event)
+			if err != nil {
+				return nil, nil, err
+			}
+			copyOfFrames[0].Payload = payload
+			return encodeRawWALFrames(copyOfFrames), snapshotRaw, nil
+		}},
+		{name: "noncontiguous-wal-sequence", mutate: func(_ []byte, snapshotRaw []byte) ([]byte, []byte, error) {
+			copyOfFrames := cloneRawWALFrames(frames)
+			newSequence := binary.LittleEndian.Uint64(copyOfFrames[1].Header[16:24]) + 1
+			binary.LittleEndian.PutUint64(copyOfFrames[1].Header[16:24], newSequence)
+			var event durableEvent
+			if err := json.Unmarshal(copyOfFrames[1].Payload, &event); err != nil {
+				return nil, nil, err
+			}
+			event.Sequence = newSequence
+			payload, err := json.Marshal(event)
+			if err != nil {
+				return nil, nil, err
+			}
+			copyOfFrames[1].Payload = payload
+			return encodeRawWALFrames(copyOfFrames), snapshotRaw, nil
+		}},
+		{name: "invalid-event-type", mutate: func(_ []byte, snapshotRaw []byte) ([]byte, []byte, error) {
+			result, err := rewriteEvent(0, func(event *durableEvent) { event.Type = "job_impossible" })
+			return result, snapshotRaw, err
+		}},
+		{name: "invalid-transition-semantics", mutate: func(_ []byte, snapshotRaw []byte) ([]byte, []byte, error) {
+			result, err := rewriteEvent(0, func(event *durableEvent) {
+				event.Job.Status = "succeeded"
+				event.Job.CompletedAt = event.Job.UpdatedAt
+			})
+			return result, snapshotRaw, err
+		}},
+		{name: "malformed-snapshot", mutate: func(walRaw, snapshotRaw []byte) ([]byte, []byte, error) {
+			return walRaw, append([]byte(nil), snapshotRaw[:len(snapshotRaw)/2]...), nil
+		}},
+		{name: "bad-snapshot-version", mutate: func(walRaw, _ []byte) ([]byte, []byte, error) {
+			result, err := rewriteSnapshot(func(value *durableSnapshot) { value.Version = 2 })
+			return walRaw, result, err
+		}},
+		{name: "unknown-snapshot-field", mutate: func(walRaw, snapshotRaw []byte) ([]byte, []byte, error) {
+			trimmed := bytes.TrimSpace(snapshotRaw)
+			result := append(append([]byte(nil), trimmed[:len(trimmed)-1]...), []byte(`,"unexpected":true}`)...)
+			return walRaw, result, nil
+		}},
+		{name: "trailing-snapshot-json", mutate: func(walRaw, snapshotRaw []byte) ([]byte, []byte, error) {
+			return walRaw, append(append([]byte(nil), snapshotRaw...), []byte(`{}`)...), nil
+		}},
+		{name: "snapshot-job-key-mismatch", mutate: func(walRaw, _ []byte) ([]byte, []byte, error) {
+			result, err := rewriteSnapshot(func(value *durableSnapshot) {
+				for id, item := range value.Jobs {
+					delete(value.Jobs, id)
+					value.Jobs["wrong-"+id] = item
+					break
+				}
+			})
+			return walRaw, result, err
+		}},
+		{name: "snapshot-sequence-gap", mutate: func(walRaw, _ []byte) ([]byte, []byte, error) {
+			result, err := rewriteSnapshot(func(value *durableSnapshot) { value.LastSequence++ })
+			return walRaw, result, err
+		}},
+		{name: "nil-snapshot-jobs", mutate: func(walRaw, _ []byte) ([]byte, []byte, error) {
+			result, err := rewriteSnapshot(func(value *durableSnapshot) { value.Jobs = nil })
+			return walRaw, result, err
 		}},
 	}
 	for _, item := range cases {
@@ -777,12 +1458,15 @@ func testCorruptionFailsClosed(v *verifier) error {
 			return err
 		}
 		walPath := filepath.Join(stateDir, "events.wal")
-		mutated := item.mutate(original)
-		if err := os.WriteFile(walPath, mutated, 0o600); err != nil {
+		snapshotPath := filepath.Join(stateDir, "snapshot.json")
+		mutatedWAL, mutatedSnapshot, err := item.mutate(originalWAL, originalSnapshot)
+		if err != nil {
+			return fmt.Errorf("construct %s damage: %w", item.name, err)
+		}
+		if err := os.WriteFile(walPath, mutatedWAL, 0o600); err != nil {
 			return err
 		}
-		beforeDigest, _, err := fileDigest(walPath)
-		if err != nil {
+		if err := os.WriteFile(snapshotPath, mutatedSnapshot, 0o600); err != nil {
 			return err
 		}
 		caseConfig := cfg
@@ -795,16 +1479,20 @@ func testCorruptionFailsClosed(v *verifier) error {
 		if err := writeJSON(caseConfigPath, caseConfig); err != nil {
 			return err
 		}
-		output, err := expectStartupFailure(v.binDir, caseConfigPath, 1200*time.Millisecond)
+		output, err := expectStartupFailure(v.binDir, caseConfigPath, caseConfig.Listen, 1500*time.Millisecond)
 		if err != nil {
 			return fmt.Errorf("%s did not fail closed: %w output=%s", item.name, err, strings.TrimSpace(output))
 		}
-		afterDigest, afterRaw, err := fileDigest(walPath)
+		afterWAL, err := os.ReadFile(walPath)
 		if err != nil {
 			return err
 		}
-		if afterDigest != beforeDigest || !bytes.Equal(afterRaw, mutated) {
-			return fmt.Errorf("%s startup rewrote damaged WAL", item.name)
+		afterSnapshot, err := os.ReadFile(snapshotPath)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(afterWAL, mutatedWAL) || !bytes.Equal(afterSnapshot, mutatedSnapshot) {
+			return fmt.Errorf("%s startup rewrote forensic state", item.name)
 		}
 	}
 	return nil
