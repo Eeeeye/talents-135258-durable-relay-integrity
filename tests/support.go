@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -180,6 +181,16 @@ func (v *verifier) bytes(size int) []byte {
 	return raw
 }
 
+func (v *verifier) intBetween(minimum, maximum int) int {
+	if maximum < minimum {
+		panic("invalid verifier integer range")
+	}
+	v.rngMu.Lock()
+	value := minimum + v.rng.Intn(maximum-minimum+1)
+	v.rngMu.Unlock()
+	return value
+}
+
 func writeJSON(path string, value any) error {
 	raw, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
@@ -298,7 +309,31 @@ type service struct {
 	waitErr    error
 }
 
-func startService(binDir, configPath, address, logDir string) (*service, error) {
+func startService(binDir, configPath string, cfg *configFile, logDir string) (*service, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		svc, err := startServiceAttempt(binDir, configPath, cfg.Listen, logDir)
+		if err == nil {
+			return svc, nil
+		}
+		lastErr = err
+		if !strings.Contains(strings.ToLower(err.Error()), "address already in use") {
+			return nil, err
+		}
+		address, reserveErr := reserveAddress()
+		if reserveErr != nil {
+			return nil, errors.Join(err, reserveErr)
+		}
+		cfg.Listen = address
+		if writeErr := writeJSON(configPath, *cfg); writeErr != nil {
+			return nil, errors.Join(err, writeErr)
+		}
+		time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
+	}
+	return nil, fmt.Errorf("relayqd startup exhausted address retries: %w", lastErr)
+}
+
+func startServiceAttempt(binDir, configPath, address, logDir string) (*service, error) {
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -313,7 +348,7 @@ func startService(binDir, configPath, address, logDir string) (*service, error) 
 		_ = stdout.Close()
 		return nil, err
 	}
-	cmd := exec.Command(filepath.Join(binDir, "relayqd"), "-config", configPath)
+	cmd := exec.Command(filepath.Join(binDir, "relayqd"), "-config", configPath, "-log-level", "debug")
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
@@ -356,6 +391,20 @@ func startService(binDir, configPath, address, logDir string) (*service, error) 
 	svc.kill()
 	raw, _ := os.ReadFile(stderrPath)
 	return nil, fmt.Errorf("relayqd did not become ready: %s", strings.TrimSpace(string(raw)))
+}
+
+func runCLI(timeout time.Duration, path string, arguments ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, arguments...)
+	output, err := cmd.CombinedOutput()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return output, fmt.Errorf("command timed out: %s %s", path, strings.Join(arguments, " "))
+	}
+	if err != nil {
+		return output, fmt.Errorf("command failed: %s %s: %w: %s", path, strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
+	}
+	return output, nil
 }
 
 func setProcessFileSizeLimit(pid int, limit uint64) error {
@@ -917,8 +966,26 @@ func copyTree(source, destination string) error {
 	})
 }
 
-func expectStartupFailure(binDir, configPath, address string, timeout time.Duration) (string, error) {
-	cmd := exec.Command(filepath.Join(binDir, "relayqd"), "-config", configPath)
+func expectStartupFailure(binDir, configPath string, cfg *configFile, timeout time.Duration) (string, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		output, err := expectStartupFailureAttempt(binDir, configPath, cfg.Listen, timeout)
+		if err != nil || !strings.Contains(strings.ToLower(output), "address already in use") {
+			return output, err
+		}
+		address, reserveErr := reserveAddress()
+		if reserveErr != nil {
+			return output, reserveErr
+		}
+		cfg.Listen = address
+		if writeErr := writeJSON(configPath, *cfg); writeErr != nil {
+			return output, writeErr
+		}
+	}
+	return "", errors.New("relayqd corrupt-state check exhausted address retries")
+}
+
+func expectStartupFailureAttempt(binDir, configPath, address string, timeout time.Duration) (string, error) {
+	cmd := exec.Command(filepath.Join(binDir, "relayqd"), "-config", configPath, "-log-level", "error")
 	var combined bytes.Buffer
 	cmd.Stdout = &combined
 	cmd.Stderr = &combined

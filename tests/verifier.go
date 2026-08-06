@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -46,6 +47,7 @@ func main() {
 		name string
 		run  func(*verifier) error
 	}{
+		{"public-cli-compatibility", testPublicCLICompatibility},
 		{"ordinary-and-atomic-publication", testOrdinaryAndAtomicPublication},
 		{"strict-http-contract", testStrictHTTPContract},
 		{"durable-idempotency", testDurableIdempotency},
@@ -68,6 +70,160 @@ func main() {
 		fmt.Printf("PASS %s (%s)\n", test.name, time.Since(started).Round(time.Millisecond))
 	}
 	fmt.Printf("all integration checks passed; seed=%d\n", seed)
+}
+
+func testPublicCLICompatibility(v *verifier) error {
+	directory := filepath.Join(v.root, "public CLI compatibility")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	cfg := baseConfig()
+	configPath, cfg, err := v.prepareConfig(directory, cfg)
+	if err != nil {
+		return err
+	}
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs"))
+	if err != nil {
+		return err
+	}
+	defer svc.kill()
+
+	fixtureRoot := filepath.Join(directory, "generated fixture with spaces")
+	fixtureOutput, err := runCLI(8*time.Second, filepath.Join(v.binDir, "relayfixture"),
+		"-root", fixtureRoot,
+		"-mode", "valid",
+		"-chunks", "3",
+		"-chunk-size", strconv.Itoa(v.intBetween(1025, 4097)),
+		"-seed", v.token("cli-fixture"),
+	)
+	if err != nil {
+		return err
+	}
+	var generated struct {
+		Manifest       string `json:"manifest"`
+		ArtifactSize   int64  `json:"artifact_size"`
+		ArtifactSHA256 string `json:"artifact_sha256"`
+	}
+	if err := json.Unmarshal(fixtureOutput, &generated); err != nil {
+		return fmt.Errorf("relayfixture output: %w: %s", err, strings.TrimSpace(string(fixtureOutput)))
+	}
+	if generated.Manifest == "" || generated.ArtifactSize <= 0 || len(generated.ArtifactSHA256) != 64 {
+		return fmt.Errorf("relayfixture summary is incomplete: %+v", generated)
+	}
+
+	ctl := func(arguments ...string) ([]byte, error) {
+		global := []string{"-addr", "http://" + svc.addr, "-timeout", "8s", "-pretty"}
+		return runCLI(10*time.Second, filepath.Join(v.binDir, "relayctl"), append(global, arguments...)...)
+	}
+	healthOutput, err := ctl("health")
+	if err != nil {
+		return err
+	}
+	var observedHealth health
+	if err := json.Unmarshal(healthOutput, &observedHealth); err != nil || !observedHealth.Ready {
+		return fmt.Errorf("relayctl health output=%s err=%v", strings.TrimSpace(string(healthOutput)), err)
+	}
+
+	requestID := v.token("cli-submit")
+	destination := filepath.Join(directory, "CLI archive", "artifact with spaces.bin")
+	submitOutput, err := ctl("submit",
+		"-request", requestID,
+		"-manifest", generated.Manifest,
+		"-destination", destination,
+		"-max-attempts", "2",
+	)
+	if err != nil {
+		return err
+	}
+	var submitted submitResult
+	if err := json.Unmarshal(submitOutput, &submitted); err != nil || submitted.Job.ID == "" || submitted.Existing {
+		return fmt.Errorf("relayctl submit output=%s err=%v", strings.TrimSpace(string(submitOutput)), err)
+	}
+	waitOutput, err := ctl("wait", "-request", requestID, "-poll", "5ms")
+	if err != nil {
+		return err
+	}
+	var completed job
+	if err := json.Unmarshal(waitOutput, &completed); err != nil || completed.Status != "succeeded" || completed.ID != submitted.Job.ID {
+		return fmt.Errorf("relayctl wait output=%s err=%v", strings.TrimSpace(string(waitOutput)), err)
+	}
+	for _, invocation := range [][]string{
+		{"get", "-id", submitted.Job.ID},
+		{"list", "-request", requestID},
+		{"stats"},
+		{"reload"},
+	} {
+		if _, err := ctl(invocation...); err != nil {
+			return err
+		}
+	}
+
+	if _, err := runCLI(5*time.Second, filepath.Join(v.binDir, "relayinspect"),
+		"artifact", "-path", destination,
+		"-sha256", generated.ArtifactSHA256,
+		"-size", strconv.FormatInt(generated.ArtifactSize, 10),
+	); err != nil {
+		return err
+	}
+	if _, err := runCLI(5*time.Second, filepath.Join(v.binDir, "relayinspect"),
+		"wal", "-path", filepath.Join(cfg.StateDir, "events.wal"),
+	); err != nil {
+		return err
+	}
+	receiptOutput, err := runCLI(5*time.Second, filepath.Join(v.binDir, "relayinspect"),
+		"receipts", "-path", filepath.Join(cfg.StateDir, "receipts.jsonl"),
+		"-request", requestID, "-count-only",
+	)
+	if err != nil || strings.TrimSpace(string(receiptOutput)) != "1" {
+		return fmt.Errorf("relayinspect receipts output=%q err=%v", strings.TrimSpace(string(receiptOutput)), err)
+	}
+
+	floodOutput, err := ctl("flood",
+		"-manifest", generated.Manifest,
+		"-destination-dir", filepath.Join(directory, "flood archive"),
+		"-prefix", v.token("cli-flood"),
+		"-count", "2",
+		"-parallel", "2",
+	)
+	if err != nil {
+		return err
+	}
+	var flood struct {
+		Requested int      `json:"requested"`
+		Accepted  int64    `json:"accepted"`
+		Failed    int64    `json:"failed"`
+		JobIDs    []string `json:"job_ids"`
+	}
+	if err := json.Unmarshal(floodOutput, &flood); err != nil || flood.Requested != 2 || flood.Accepted != 2 || flood.Failed != 0 || len(flood.JobIDs) != 2 {
+		return fmt.Errorf("relayctl flood output=%s err=%v", strings.TrimSpace(string(floodOutput)), err)
+	}
+	for _, id := range flood.JobIDs {
+		value, err := waitTerminal(svc, id, 8*time.Second)
+		if err != nil || value.Status != "succeeded" {
+			return fmt.Errorf("relayctl flood job %q completion=%+v err=%v", id, value, err)
+		}
+	}
+	if _, err := ctl("compact"); err != nil {
+		return err
+	}
+	snapshotOutput, err := runCLI(5*time.Second, filepath.Join(v.binDir, "relayinspect"),
+		"snapshot", "-path", filepath.Join(cfg.StateDir, "snapshot.json"),
+	)
+	if err != nil {
+		return err
+	}
+	var snapshotSummary struct {
+		Exists       bool   `json:"exists"`
+		LastSequence uint64 `json:"last_sequence"`
+		Jobs         int    `json:"jobs"`
+	}
+	if err := json.Unmarshal(snapshotOutput, &snapshotSummary); err != nil || !snapshotSummary.Exists || snapshotSummary.LastSequence == 0 || snapshotSummary.Jobs != 3 {
+		return fmt.Errorf("relayinspect snapshot output=%s err=%v", strings.TrimSpace(string(snapshotOutput)), err)
+	}
+	if err := svc.stop(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func verifierSeed() (int64, error) {
@@ -97,7 +253,7 @@ func testOrdinaryAndAtomicPublication(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	svc, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs"))
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs"))
 	if err != nil {
 		return err
 	}
@@ -243,7 +399,7 @@ func testStrictHTTPContract(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	svc, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs"))
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs"))
 	if err != nil {
 		return err
 	}
@@ -404,7 +560,7 @@ func testDurableIdempotency(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	svc, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-one"))
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-one"))
 	if err != nil {
 		return err
 	}
@@ -584,7 +740,7 @@ func testDurableIdempotency(v *verifier) error {
 	if err := writeJSON(configPath, cfg); err != nil {
 		return err
 	}
-	restarted, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-two"))
+	restarted, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-two"))
 	if err != nil {
 		return err
 	}
@@ -624,7 +780,7 @@ func testQueueAdmissionOwnership(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	svc, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-one"))
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-one"))
 	if err != nil {
 		return err
 	}
@@ -677,6 +833,15 @@ func testQueueAdmissionOwnership(v *verifier) error {
 			Destination: filepath.Join(directory, "queued archive", fmt.Sprintf("candidate-%03d.bin", index)),
 			MaxAttempts: 1,
 		}
+		beforeStats, statsErr := svc.readStats()
+		if statsErr != nil {
+			return statsErr
+		}
+		walPath := filepath.Join(cfg.StateDir, "events.wal")
+		beforeWAL, readErr := os.ReadFile(walPath)
+		if readErr != nil {
+			return readErr
+		}
 		candidateStatus, result, candidateRaw, submitErr := svc.submit(candidate)
 		if submitErr != nil {
 			return submitErr
@@ -692,6 +857,22 @@ func testQueueAdmissionOwnership(v *verifier) error {
 			_ = json.Unmarshal(candidateRaw, &envelope)
 			if envelope.Error.Code != "queue_full" {
 				return fmt.Errorf("queue rejection code=%q body=%s", envelope.Error.Code, strings.TrimSpace(string(candidateRaw)))
+			}
+			afterStats, statsErr := svc.readStats()
+			if statsErr != nil {
+				return statsErr
+			}
+			afterWAL, readErr := os.ReadFile(walPath)
+			if readErr != nil {
+				return readErr
+			}
+			if afterStats.Runtime.Accepted != beforeStats.Runtime.Accepted ||
+				afterStats.Runtime.WALAppends != beforeStats.Runtime.WALAppends ||
+				afterStats.Runtime.WALBytes != beforeStats.Runtime.WALBytes ||
+				afterStats.LastSequence != beforeStats.LastSequence ||
+				!bytes.Equal(afterWAL, beforeWAL) {
+				return fmt.Errorf("queue_full mutated durable admission state for %q: before_stats=%+v after_stats=%+v wal_before=%d wal_after=%d",
+					candidate.RequestID, beforeStats, afterStats, len(beforeWAL), len(afterWAL))
 			}
 			rejected = append(rejected, candidate)
 		default:
@@ -764,7 +945,7 @@ func testQueueAdmissionOwnership(v *verifier) error {
 	if err := writeJSON(configPath, cfg); err != nil {
 		return err
 	}
-	restarted, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-two"))
+	restarted, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-two"))
 	if err != nil {
 		return err
 	}
@@ -800,7 +981,33 @@ func testSuccessReceiptCrashRecovery(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	svc, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-one"))
+	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+		return err
+	}
+	// Make the receipt ledger much larger than the WAL before relayqd opens it.
+	// A process-wide RLIMIT_FSIZE can then permit the next success frame while
+	// deterministically rejecting any append at the ledger's existing offset.
+	var historical bytes.Buffer
+	encoder := json.NewEncoder(&historical)
+	for index := 0; index < 256; index++ {
+		value := receipt{
+			Version:        1,
+			JobID:          fmt.Sprintf("historical-job-%03d", index),
+			RequestID:      fmt.Sprintf("historical-request-%03d", index),
+			Destination:    filepath.Join(directory, "historical", strings.Repeat("x", 1024), fmt.Sprintf("artifact-%03d.bin", index)),
+			ArtifactSize:   int64(index + 1),
+			ArtifactSHA256: strings.Repeat("a", 64),
+			CompletedAt:    time.Unix(1700000000+int64(index), 0).UTC(),
+		}
+		if err := encoder.Encode(value); err != nil {
+			return err
+		}
+	}
+	receiptPath := filepath.Join(cfg.StateDir, "receipts.jsonl")
+	if err := os.WriteFile(receiptPath, historical.Bytes(), 0o600); err != nil {
+		return err
+	}
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-one"))
 	if err != nil {
 		return err
 	}
@@ -843,9 +1050,19 @@ func testSuccessReceiptCrashRecovery(v *verifier) error {
 		_ = fifoWriter.Close()
 		return fmt.Errorf("pre-success WAL is too small for safe failure injection: %d", walInfo.Size())
 	}
-	if err := setProcessFileSizeLimit(svc.cmd.Process.Pid, uint64(walInfo.Size())); err != nil {
+	limit := uint64(walInfo.Size()) + 64<<10
+	receiptInfo, err := os.Stat(receiptPath)
+	if err != nil {
 		_ = fifoWriter.Close()
-		return fmt.Errorf("limit next durable write: %w", err)
+		return err
+	}
+	if uint64(receiptInfo.Size()) <= limit {
+		_ = fifoWriter.Close()
+		return fmt.Errorf("historical receipt ledger %d does not exceed injected limit %d", receiptInfo.Size(), limit)
+	}
+	if err := setProcessFileSizeLimit(svc.cmd.Process.Pid, limit); err != nil {
+		_ = fifoWriter.Close()
+		return fmt.Errorf("separate success and receipt writes: %w", err)
 	}
 	if _, err := fifoWriter.Write(payload); err != nil {
 		_ = fifoWriter.Close()
@@ -866,7 +1083,44 @@ func testSuccessReceiptCrashRecovery(v *verifier) error {
 	if err != nil || !bytes.Equal(observed, payload) {
 		return fmt.Errorf("artifact was not published before injected termination: bytes=%d err=%v", len(observed), err)
 	}
-	time.Sleep(50 * time.Millisecond)
+	artifactBefore, err := os.Stat(spec.Destination)
+	if err != nil {
+		return err
+	}
+
+	walPath := filepath.Join(cfg.StateDir, "events.wal")
+	var durableSuccess durableEvent
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		scan, scanErr := scanWAL(walPath, 0)
+		if scanErr == nil {
+			for _, event := range scan.Events {
+				if event.Job.ID == submitted.Job.ID && event.Type == "job_succeeded" {
+					durableSuccess = event
+					break
+				}
+			}
+		}
+		if durableSuccess.Job.ID != "" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if durableSuccess.Job.ID == "" {
+		return errors.New("injected crash window never exposed a complete durable job_succeeded frame")
+	}
+	if durableSuccess.Job.Attempts != 1 || durableSuccess.Job.Status != "succeeded" || durableSuccess.Job.ArtifactSHA != generated.ArtifactSHA {
+		return fmt.Errorf("durable success frame is inconsistent: %+v", durableSuccess)
+	}
+	beforeKillReceipts, err := readReceipts(receiptPath)
+	if err != nil {
+		return err
+	}
+	for _, value := range beforeKillReceipts {
+		if value.JobID == submitted.Job.ID || value.RequestID == spec.RequestID {
+			return fmt.Errorf("target receipt was written despite injected ledger failure: %+v", value)
+		}
+	}
 	svc.kill()
 
 	address, err := reserveAddress()
@@ -877,43 +1131,45 @@ func testSuccessReceiptCrashRecovery(v *verifier) error {
 	if err := writeJSON(configPath, cfg); err != nil {
 		return err
 	}
-	restarted, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-two"))
+	restarted, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-two"))
 	if err != nil {
 		return fmt.Errorf("restart after receipt-edge kill: %w", err)
 	}
 	defer restarted.kill()
-	restartWriter := make(chan fifoOpenResult, 1)
-	go func() {
-		file, openErr := os.OpenFile(fifoPath, os.O_WRONLY, 0)
-		restartWriter <- fifoOpenResult{path: fifoPath, file: file, err: openErr}
-	}()
-	select {
-	case opened := <-restartWriter:
-		if opened.err != nil {
-			return opened.err
-		}
-		if _, err := opened.file.Write(payload); err != nil {
-			_ = opened.file.Close()
-			return err
-		}
-		if err := opened.file.Close(); err != nil {
-			return err
-		}
-	case <-time.After(2 * time.Second):
-		return fmt.Errorf("recovered attempt did not reopen controlled fixture")
-	}
-	recovered, err := waitTerminal(restarted, submitted.Job.ID, 5*time.Second)
+	recovered, err := restarted.getJob(submitted.Job.ID)
 	if err != nil {
 		return err
 	}
-	if recovered.Status != "succeeded" || recovered.Attempts != 2 || recovered.ArtifactSHA != generated.ArtifactSHA {
+	if recovered.Status != "succeeded" || recovered.Attempts != durableSuccess.Job.Attempts || recovered.ArtifactSHA != generated.ArtifactSHA || !recovered.CompletedAt.Equal(durableSuccess.Job.CompletedAt) {
 		return fmt.Errorf("receipt-edge recovery changed successful job: %+v", recovered)
+	}
+	// A nonblocking FIFO writer succeeds only while a reader is present. Polling
+	// it proves recovery did not enqueue and re-run the already durable job.
+	deadline = time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		fd, openErr := syscall.Open(fifoPath, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if openErr == nil {
+			_ = syscall.Close(fd)
+			return errors.New("recovery reopened the manifest FIFO and attempted a second publication")
+		}
+		if !errors.Is(openErr, syscall.ENXIO) {
+			return fmt.Errorf("probe recovered FIFO reader: %w", openErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	artifactAfter, err := os.Stat(spec.Destination)
+	if err != nil {
+		return err
+	}
+	afterBytes, err := os.ReadFile(spec.Destination)
+	if err != nil || !bytes.Equal(afterBytes, payload) || !os.SameFile(artifactBefore, artifactAfter) {
+		return fmt.Errorf("recovery republished the artifact: bytes=%d same_file=%v err=%v", len(afterBytes), os.SameFile(artifactBefore, artifactAfter), err)
 	}
 	jobs, err := restarted.listByRequest(spec.RequestID)
 	if err != nil || len(jobs) != 1 || jobs[0].ID != submitted.Job.ID {
 		return fmt.Errorf("receipt-edge recovery changed identity: jobs=%+v err=%v", jobs, err)
 	}
-	receipts, err := readReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"))
+	receipts, err := readReceipts(receiptPath)
 	if err != nil {
 		return err
 	}
@@ -987,7 +1243,7 @@ func testTransactionalReload(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	svc, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs"))
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs"))
 	if err != nil {
 		return err
 	}
@@ -1105,10 +1361,10 @@ func testTransactionalReload(v *verifier) error {
 	}
 
 	updated := cfg
-	updated.WorkerCount = 2
-	updated.RetryBaseMS = 150
-	updated.MaxAttempts = 4
-	updated.MaxRequestBytes = 4096
+	updated.WorkerCount = v.intBetween(2, 4)
+	updated.RetryBaseMS = v.intBetween(220, 360)
+	updated.MaxAttempts = v.intBetween(3, 6)
+	updated.MaxRequestBytes = int64(v.intBetween(5000, 7000))
 	if err := writeJSON(configPath, updated); err != nil {
 		return err
 	}
@@ -1129,12 +1385,31 @@ func testTransactionalReload(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	if after.Config.Generation != 2 || after.Config.WorkerCount != 2 || after.Config.RetryBaseMS != 150 ||
-		after.Config.MaxAttempts != 4 || after.Config.MaxRequestBytes != 4096 || after.Runtime.ActiveWorkerLimit != 2 {
+	if after.Config != (configSnapshot{Generation: 2, configFile: updated}) || after.Runtime.ActiveWorkerLimit != int64(updated.WorkerCount) {
 		return fmt.Errorf("mutable reload not coherent: %+v", after)
 	}
 
-	scaledDown := updated
+	unchangedWorkers := updated
+	unchangedWorkers.RetryBaseMS = v.intBetween(80, 160)
+	unchangedWorkers.MaxAttempts = v.intBetween(7, 10)
+	unchangedWorkers.MaxRequestBytes = int64(v.intBetween(9000, 12000))
+	if err := writeJSON(configPath, unchangedWorkers); err != nil {
+		return err
+	}
+	status, raw, err = svc.requestJSON(http.MethodPost, "/v1/admin/reload", nil)
+	if err != nil || status != http.StatusOK {
+		return fmt.Errorf("unchanged-worker reload status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	}
+	unchangedStats, err := svc.readStats()
+	if err != nil {
+		return err
+	}
+	if unchangedStats.Config != (configSnapshot{Generation: 3, configFile: unchangedWorkers}) ||
+		unchangedStats.Runtime.ActiveWorkerLimit != int64(unchangedWorkers.WorkerCount) || unchangedStats.Runtime.ActiveWorkers != 2 {
+		return fmt.Errorf("unchanged-worker reload not coherent: %+v", unchangedStats)
+	}
+
+	scaledDown := unchangedWorkers
 	scaledDown.WorkerCount = 1
 	if err := writeJSON(configPath, scaledDown); err != nil {
 		return err
@@ -1147,7 +1422,7 @@ func testTransactionalReload(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	if downStats.Config.Generation != 3 || downStats.Config.WorkerCount != 1 || downStats.Runtime.ActiveWorkerLimit != 1 || downStats.Runtime.ActiveWorkers != 2 {
+	if downStats.Config != (configSnapshot{Generation: 4, configFile: scaledDown}) || downStats.Runtime.ActiveWorkerLimit != 1 || downStats.Runtime.ActiveWorkers != 2 {
 		return fmt.Errorf("scale-down state is not immediate and non-cancelling: %+v", downStats)
 	}
 	thirdStatus, thirdSubmit, raw, err := svc.submit(jobSpec{
@@ -1240,25 +1515,58 @@ func testTransactionalReload(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	if retrying.Spec.MaxAttempts != 4 {
+	if retrying.Spec.MaxAttempts != scaledDown.MaxAttempts {
 		return fmt.Errorf("new default max_attempts not applied: %+v", retrying.Spec)
 	}
 	retryStarted := time.Now()
 	if err := os.WriteFile(retryFixture.ChunkPaths[0], retryData, 0o600); err != nil {
 		return err
 	}
-	retried, err := waitTerminal(svc, retrySubmit.Job.ID, 450*time.Millisecond)
+	retryBudget := time.Duration(scaledDown.RetryBaseMS)*4*time.Millisecond + 500*time.Millisecond
+	retried, err := waitTerminal(svc, retrySubmit.Job.ID, retryBudget)
 	if err != nil {
-		return fmt.Errorf("new retry_base_ms was not live within 450ms: %w", err)
+		return fmt.Errorf("new retry_base_ms=%d was not live within %s: %w", scaledDown.RetryBaseMS, retryBudget, err)
 	}
-	if retried.Status != "succeeded" || time.Since(retryStarted) >= 450*time.Millisecond {
+	if retried.Status != "succeeded" || time.Since(retryStarted) >= retryBudget {
 		return fmt.Errorf("retried job mismatch: %+v elapsed=%s", retried, time.Since(retryStarted))
 	}
 
-	oversized := []byte(`{"request_id":"oversized","manifest":"m","destination":"d","padding":"` + strings.Repeat("x", 5000) + `"}`)
+	boundarySpec := jobSpec{
+		RequestID: v.token("reload-size-within"), Manifest: retryFixture.Manifest,
+		Destination: "d", MaxAttempts: 1,
+	}
+	baseRaw, err := json.Marshal(boundarySpec)
+	if err != nil {
+		return err
+	}
+	withinPadding := int(scaledDown.MaxRequestBytes) - len(baseRaw) - 64
+	if withinPadding < 1 {
+		return fmt.Errorf("randomized max_request_bytes is too small for boundary probe: %d", scaledDown.MaxRequestBytes)
+	}
+	boundarySpec.Destination = strings.Repeat("d", withinPadding)
+	withinRaw, err := json.Marshal(boundarySpec)
+	if err != nil {
+		return err
+	}
+	if int64(len(withinRaw)) >= scaledDown.MaxRequestBytes {
+		return fmt.Errorf("within-limit probe length=%d limit=%d", len(withinRaw), scaledDown.MaxRequestBytes)
+	}
+	status, _, raw, err = svc.submit(boundarySpec)
+	if err != nil || status != http.StatusAccepted {
+		return fmt.Errorf("reloaded max_request_bytes rejected within-limit request: size=%d limit=%d status=%d err=%v body=%s",
+			len(withinRaw), scaledDown.MaxRequestBytes, status, err, strings.TrimSpace(string(raw)))
+	}
+	overSpec := boundarySpec
+	overSpec.RequestID = v.token("reload-size-over")
+	overSpec.Destination = strings.Repeat("d", int(scaledDown.MaxRequestBytes)+512)
+	oversized, err := json.Marshal(overSpec)
+	if err != nil {
+		return err
+	}
 	status, raw, err = svc.requestRaw(http.MethodPost, "/v1/jobs", "application/json", oversized)
 	if err != nil || status != http.StatusBadRequest {
-		return fmt.Errorf("reloaded max_request_bytes not enforced: status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+		return fmt.Errorf("reloaded max_request_bytes=%d not enforced for size=%d: status=%d err=%v body=%s",
+			scaledDown.MaxRequestBytes, len(oversized), status, err, strings.TrimSpace(string(raw)))
 	}
 	if err := svc.stop(); err != nil {
 		return err
@@ -1279,7 +1587,7 @@ func testConcurrentWALCompaction(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	svc, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-one"))
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-one"))
 	if err != nil {
 		return err
 	}
@@ -1288,6 +1596,53 @@ func testConcurrentWALCompaction(v *verifier) error {
 	if err != nil {
 		return err
 	}
+	snapshotPath := filepath.Join(cfg.StateDir, "snapshot.json")
+	status, raw, err := svc.requestJSON(http.MethodPost, "/v1/admin/compact", nil)
+	if err != nil || status != http.StatusOK {
+		return fmt.Errorf("prime snapshot status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	}
+	if _, exists, err := readSnapshot(snapshotPath); err != nil || !exists {
+		return fmt.Errorf("prime snapshot is not independently readable: exists=%v err=%v", exists, err)
+	}
+	type snapshotObservation struct {
+		reads       int
+		maxSequence uint64
+		err         error
+	}
+	observerStop := make(chan struct{})
+	observerResult := make(chan snapshotObservation, 1)
+	var observerStopOnce sync.Once
+	stopObserver := func() { observerStopOnce.Do(func() { close(observerStop) }) }
+	defer stopObserver()
+	go func() {
+		result := snapshotObservation{}
+		var previous uint64
+		for {
+			select {
+			case <-observerStop:
+				observerResult <- result
+				return
+			default:
+			}
+			observed, exists, readErr := readSnapshot(snapshotPath)
+			result.reads++
+			if readErr != nil || !exists {
+				result.err = fmt.Errorf("snapshot reader observed a partial or missing file: exists=%v err=%v", exists, readErr)
+				observerResult <- result
+				return
+			}
+			if observed.LastSequence < previous {
+				result.err = fmt.Errorf("snapshot reader observed sequence regression %d -> %d", previous, observed.LastSequence)
+				observerResult <- result
+				return
+			}
+			previous = observed.LastSequence
+			if observed.LastSequence > result.maxSequence {
+				result.maxSequence = observed.LastSequence
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
 
 	const count = 120
 	type submitOutcome struct {
@@ -1335,6 +1690,14 @@ func testConcurrentWALCompaction(v *verifier) error {
 	if err := <-compactErrors; err != nil {
 		return err
 	}
+	stopObserver()
+	observation := <-observerResult
+	if observation.err != nil {
+		return observation.err
+	}
+	if observation.reads < 5 || observation.maxSequence == 0 {
+		return fmt.Errorf("snapshot observer did not overlap compaction: %+v", observation)
+	}
 	for index, outcome := range outcomes {
 		if outcome.err != nil || outcome.status != http.StatusAccepted || outcome.jobID == "" {
 			return fmt.Errorf("bulk submit %d status=%d job=%q err=%v body=%s", index, outcome.status, outcome.jobID, outcome.err, strings.TrimSpace(string(outcome.raw)))
@@ -1365,7 +1728,7 @@ func testConcurrentWALCompaction(v *verifier) error {
 		return err
 	}
 
-	snapshot, exists, err := readSnapshot(filepath.Join(cfg.StateDir, "snapshot.json"))
+	snapshot, exists, err := readSnapshot(snapshotPath)
 	if err != nil {
 		return fmt.Errorf("independent snapshot parse: %w", err)
 	}
@@ -1414,7 +1777,7 @@ func testConcurrentWALCompaction(v *verifier) error {
 	if err := writeJSON(configPath, cfg); err != nil {
 		return err
 	}
-	restarted, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-two"))
+	restarted, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-two"))
 	if err != nil {
 		return fmt.Errorf("restart after concurrent compaction: %w", err)
 	}
@@ -1464,7 +1827,7 @@ func testCorruptionFailsClosed(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	svc, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-source"))
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-source"))
 	if err != nil {
 		return err
 	}
@@ -1717,7 +2080,7 @@ func testCorruptionFailsClosed(v *verifier) error {
 		if err := writeJSON(caseConfigPath, caseConfig); err != nil {
 			return err
 		}
-		output, err := expectStartupFailure(v.binDir, caseConfigPath, caseConfig.Listen, 1500*time.Millisecond)
+		output, err := expectStartupFailure(v.binDir, caseConfigPath, &caseConfig, 1500*time.Millisecond)
 		if err != nil {
 			return fmt.Errorf("%s did not fail closed: %w output=%s", item.name, err, strings.TrimSpace(output))
 		}
