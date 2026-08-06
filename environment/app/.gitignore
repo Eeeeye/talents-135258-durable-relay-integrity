@@ -1,0 +1,5 @@
+/bin/
+/.incident-work/
+/coverage.out
+*.log
+*.tmp
