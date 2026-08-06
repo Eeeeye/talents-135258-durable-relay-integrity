@@ -2,11 +2,12 @@
 set -Eeuo pipefail
 
 umask 077
-install -d -m 0700 /logs/verifier
+install -d -m 0755 /logs/verifier
 reward=0
 finish() {
     /usr/bin/pkill -KILL -u 65534 >/dev/null 2>&1 || true
     printf '%s\n' "${reward}" > /logs/verifier/reward.txt
+    chmod 0644 /logs/verifier/reward.txt
 }
 trap finish EXIT
 
