@@ -21,13 +21,23 @@ func (e *Engine) worker(_ int) {
 		select {
 		case <-e.ctx.Done():
 			return
-		case id := <-e.queue:
+		case queued := <-e.queue:
 			e.metrics.SetQueueDepth(len(e.queue))
+			if queued.admitted != nil {
+				select {
+				case admitted := <-queued.admitted:
+					if !admitted {
+						continue
+					}
+				case <-e.ctx.Done():
+					return
+				}
+			}
 			if !e.acquireWorker() {
 				return
 			}
 			e.metrics.WorkerEntered()
-			e.process(id)
+			e.process(queued.id)
 			e.metrics.WorkerLeft()
 			e.releaseWorker()
 		}

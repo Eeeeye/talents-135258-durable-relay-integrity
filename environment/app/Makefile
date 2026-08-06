@@ -1,4 +1,4 @@
-.PHONY: all build test clean reproduce
+.PHONY: all build test clean
 
 GO ?= go
 BIN_DIR ?= bin
@@ -16,8 +16,5 @@ build:
 test:
 	$(GO) test -buildvcs=false ./...
 
-reproduce: build
-	./scripts/reproduce-incident.sh
-
 clean:
-	rm -rf -- $(BIN_DIR) .incident-work
+	rm -rf -- $(BIN_DIR)

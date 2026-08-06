@@ -46,7 +46,7 @@ type Engine struct {
 	lastSequence uint64
 	warnings     []string
 
-	queue         chan string
+	queue         chan queuedJob
 	ctx           context.Context
 	cancel        context.CancelFunc
 	wg            sync.WaitGroup
@@ -55,6 +55,16 @@ type Engine struct {
 	workerCond    *sync.Cond
 	workerLimit   int
 	activeWorkers int
+}
+
+// queuedJob lets a new submission reserve bounded queue admission before its
+// durable job_submitted event is written. Workers wait for the admission
+// decision, so they can never observe or process the job before persistence.
+// Recovered and retry work has a nil admitted channel because it is already
+// durable.
+type queuedJob struct {
+	id       string
+	admitted <-chan bool
 }
 
 type OpenResult struct {
@@ -140,7 +150,7 @@ func Open(manager *config.Manager) (OpenResult, error) {
 		requests:     requests,
 		lastSequence: lastSequence,
 		warnings:     append([]string(nil), recovery.Warnings...),
-		queue:        make(chan string, current.QueueCapacity),
+		queue:        make(chan queuedJob, current.QueueCapacity),
 		ctx:          ctx,
 		cancel:       cancel,
 		workerLimit:  current.WorkerCount,
@@ -256,13 +266,16 @@ func (e *Engine) Submit(spec model.JobSpec) (model.SubmitResult, error) {
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	admitted, err := e.reserveSubmission(job.ID)
+	if err != nil {
+		return model.SubmitResult{}, err
+	}
 	if err := e.persist(model.EventSubmitted, job); err != nil {
+		admitted <- false
 		return model.SubmitResult{}, err
 	}
 	e.metrics.Accepted()
-	if err := e.enqueue(job.ID); err != nil {
-		return model.SubmitResult{Job: job}, err
-	}
+	admitted <- true
 	return model.SubmitResult{Job: job, Existing: false}, nil
 }
 
@@ -326,11 +339,24 @@ func (e *Engine) publishPersisted(kind model.EventType, job model.Job, sequence 
 	e.stateMu.Unlock()
 }
 
+func (e *Engine) reserveSubmission(id string) (chan bool, error) {
+	admitted := make(chan bool, 1)
+	select {
+	case <-e.ctx.Done():
+		return nil, ErrClosed
+	case e.queue <- queuedJob{id: id, admitted: admitted}:
+		e.metrics.SetQueueDepth(len(e.queue))
+		return admitted, nil
+	default:
+		return nil, ErrQueueFull
+	}
+}
+
 func (e *Engine) enqueue(id string) error {
 	select {
 	case <-e.ctx.Done():
 		return ErrClosed
-	case e.queue <- id:
+	case e.queue <- queuedJob{id: id}:
 		e.metrics.SetQueueDepth(len(e.queue))
 		return nil
 	default:

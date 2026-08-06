@@ -5,6 +5,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -48,6 +49,7 @@ func main() {
 		{"ordinary-and-atomic-publication", testOrdinaryAndAtomicPublication},
 		{"strict-http-contract", testStrictHTTPContract},
 		{"durable-idempotency", testDurableIdempotency},
+		{"queue-admission-ownership", testQueueAdmissionOwnership},
 		{"success-receipt-crash-recovery", testSuccessReceiptCrashRecovery},
 		{"transactional-live-reload", testTransactionalReload},
 		{"concurrent-wal-compaction-restart", testConcurrentWALCompaction},
@@ -489,25 +491,86 @@ func testDurableIdempotency(v *verifier) error {
 		return fmt.Errorf("idempotent request has %d receipts, expected 1", count)
 	}
 
-	conflict := spec
-	conflict.Destination = filepath.Join(directory, "archive", "conflicting.bin")
-	status, _, raw, err := svc.submit(conflict)
-	if err != nil {
+	manifestLexicalDir := filepath.Join(generated.Dir, "lexical segment")
+	destinationDir := filepath.Dir(spec.Destination)
+	destinationLexicalDir := filepath.Join(destinationDir, "lexical segment")
+	if err := os.MkdirAll(manifestLexicalDir, 0o700); err != nil {
 		return err
 	}
-	var envelope errorEnvelope
-	_ = json.Unmarshal(raw, &envelope)
-	if status != http.StatusConflict || envelope.Error.Code != "idempotency_conflict" {
-		return fmt.Errorf("conflict status=%d code=%q body=%s", status, envelope.Error.Code, strings.TrimSpace(string(raw)))
+	if err := os.MkdirAll(destinationLexicalDir, 0o700); err != nil {
+		return err
 	}
-	listed, err = svc.listByRequest(spec.RequestID)
-	if err != nil || len(listed) != 1 || listed[0].ID != jobID {
-		return fmt.Errorf("conflict changed original job: jobs=%+v err=%v", listed, err)
+	destinationLink := filepath.Join(directory, "archive symlink")
+	if err := os.Symlink(destinationDir, destinationLink); err != nil {
+		return err
 	}
 
-	status, raw, err = svc.requestJSON(http.MethodPost, "/v1/admin/compact", nil)
+	type idempotencyCheck struct {
+		name         string
+		spec         jobSpec
+		wantExisting bool
+	}
+	unchanged := spec
+	unicodeWhitespace := spec
+	unicodeWhitespace.Manifest = "\u2003\u00a0" + spec.Manifest + "\u3000"
+	unicodeWhitespace.Destination = "\u2002" + spec.Destination + "\u205f\t"
+	explicitDefault := spec
+	explicitDefault.MaxAttempts = cfg.MaxAttempts
+	separator := string(os.PathSeparator)
+	manifestDotDot := spec
+	manifestDotDot.Manifest = manifestLexicalDir + separator + ".." + separator + filepath.Base(generated.Manifest)
+	destinationDotDot := spec
+	destinationDotDot.Destination = destinationLexicalDir + separator + ".." + separator + filepath.Base(spec.Destination)
+	destinationSymlink := spec
+	destinationSymlink.Destination = filepath.Join(destinationLink, filepath.Base(spec.Destination))
+	differentAttempts := spec
+	differentAttempts.MaxAttempts = cfg.MaxAttempts + 1
+	differentDestination := spec
+	differentDestination.Destination = filepath.Join(destinationDir, "conflicting.bin")
+	checks := []idempotencyCheck{
+		{name: "unchanged", spec: unchanged, wantExisting: true},
+		{name: "Unicode whitespace", spec: unicodeWhitespace, wantExisting: true},
+		{name: "explicit effective default", spec: explicitDefault, wantExisting: true},
+		{name: "manifest dot-dot alias", spec: manifestDotDot},
+		{name: "destination dot-dot alias", spec: destinationDotDot},
+		{name: "destination symlink alias", spec: destinationSymlink},
+		{name: "different effective attempts", spec: differentAttempts},
+		{name: "different destination", spec: differentDestination},
+	}
+	checkMatrix := func(stage string, target *service) error {
+		for _, check := range checks {
+			status, result, raw, submitErr := target.submit(check.spec)
+			if submitErr != nil {
+				return fmt.Errorf("%s %s submit: %w", stage, check.name, submitErr)
+			}
+			if check.wantExisting {
+				if status != http.StatusOK || !result.Existing || result.Job.ID != jobID {
+					return fmt.Errorf("%s %s duplicate status=%d result=%+v body=%s", stage, check.name, status, result, strings.TrimSpace(string(raw)))
+				}
+			} else {
+				var envelope errorEnvelope
+				_ = json.Unmarshal(raw, &envelope)
+				if status != http.StatusConflict || envelope.Error.Code != "idempotency_conflict" {
+					return fmt.Errorf("%s %s conflict status=%d code=%q body=%s", stage, check.name, status, envelope.Error.Code, strings.TrimSpace(string(raw)))
+				}
+			}
+			jobs, listErr := target.listByRequest(spec.RequestID)
+			if listErr != nil || len(jobs) != 1 || jobs[0].ID != jobID {
+				return fmt.Errorf("%s %s changed original job: jobs=%+v err=%v", stage, check.name, jobs, listErr)
+			}
+		}
+		return nil
+	}
+	if err := checkMatrix("before compact", svc); err != nil {
+		return err
+	}
+
+	status, raw, err := svc.requestJSON(http.MethodPost, "/v1/admin/compact", nil)
 	if err != nil || status != http.StatusOK {
 		return fmt.Errorf("compact before restart status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	}
+	if err := checkMatrix("after compact", svc); err != nil {
+		return err
 	}
 	if err := svc.stop(); err != nil {
 		return err
@@ -526,9 +589,8 @@ func testDurableIdempotency(v *verifier) error {
 		return err
 	}
 	defer restarted.kill()
-	status, replay, raw, err := restarted.submit(spec)
-	if err != nil || status != http.StatusOK || !replay.Existing || replay.Job.ID != jobID {
-		return fmt.Errorf("restart duplicate status=%d result=%+v err=%v body=%s", status, replay, err, strings.TrimSpace(string(raw)))
+	if err := checkMatrix("after restart", restarted); err != nil {
+		return err
 	}
 	receipts, err = readReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"))
 	if err != nil {
@@ -542,6 +604,182 @@ func testDurableIdempotency(v *verifier) error {
 	}
 	if count != 1 {
 		return fmt.Errorf("restart changed receipt count to %d", count)
+	}
+	if err := restarted.stop(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func testQueueAdmissionOwnership(v *verifier) error {
+	directory := filepath.Join(v.root, "queue admission ownership")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	cfg := baseConfig()
+	cfg.WorkerCount = 1
+	cfg.QueueCapacity = 1
+	cfg.MaxAttempts = 1
+	configPath, cfg, err := v.prepareConfig(directory, cfg)
+	if err != nil {
+		return err
+	}
+	svc, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-one"))
+	if err != nil {
+		return err
+	}
+	defer svc.kill()
+
+	blockingPayload := v.bytes(4099)
+	blocking, fifoPath, err := v.makeFIFOFixture(directory, "blocking fixture", blockingPayload)
+	if err != nil {
+		return err
+	}
+	status, blocked, raw, err := svc.submit(jobSpec{
+		RequestID: v.token("queue-blocker"), Manifest: blocking.Manifest,
+		Destination: filepath.Join(directory, "archive", "blocker.bin"), MaxAttempts: 1,
+	})
+	if err != nil || status != http.StatusAccepted {
+		return fmt.Errorf("queue blocker status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	}
+
+	writerResults := make(chan fifoOpenResult, 1)
+	go func() {
+		file, openErr := os.OpenFile(fifoPath, os.O_WRONLY, 0)
+		writerResults <- fifoOpenResult{path: fifoPath, file: file, err: openErr}
+	}()
+	var blockingWriter *os.File
+	select {
+	case result := <-writerResults:
+		if result.err != nil {
+			return result.err
+		}
+		blockingWriter = result.file
+	case <-time.After(2 * time.Second):
+		return errors.New("queue blocker did not enter its FIFO publish")
+	}
+	defer func() {
+		if blockingWriter != nil {
+			_ = blockingWriter.Close()
+		}
+	}()
+
+	ordinary, err := v.makeFixture(directory, "queued fixture", [][]byte{v.bytes(257)})
+	if err != nil {
+		return err
+	}
+	acceptedIDs := make([]string, 0, 64)
+	rejected := make([]jobSpec, 0, 2)
+	for index := 0; index < 256 && len(rejected) < 2; index++ {
+		candidate := jobSpec{
+			RequestID:   v.token(fmt.Sprintf("queue-candidate-%03d", index)),
+			Manifest:    ordinary.Manifest,
+			Destination: filepath.Join(directory, "queued archive", fmt.Sprintf("candidate-%03d.bin", index)),
+			MaxAttempts: 1,
+		}
+		candidateStatus, result, candidateRaw, submitErr := svc.submit(candidate)
+		if submitErr != nil {
+			return submitErr
+		}
+		switch candidateStatus {
+		case http.StatusAccepted:
+			if result.Existing || result.Job.ID == "" {
+				return fmt.Errorf("fresh queued submission returned %+v", result)
+			}
+			acceptedIDs = append(acceptedIDs, result.Job.ID)
+		case http.StatusServiceUnavailable:
+			var envelope errorEnvelope
+			_ = json.Unmarshal(candidateRaw, &envelope)
+			if envelope.Error.Code != "queue_full" {
+				return fmt.Errorf("queue rejection code=%q body=%s", envelope.Error.Code, strings.TrimSpace(string(candidateRaw)))
+			}
+			rejected = append(rejected, candidate)
+		default:
+			return fmt.Errorf("queue saturation status=%d result=%+v body=%s", candidateStatus, result, strings.TrimSpace(string(candidateRaw)))
+		}
+	}
+	if len(rejected) != 2 {
+		return fmt.Errorf("bounded queue did not reject two submissions; accepted=%d rejected=%d", len(acceptedIDs), len(rejected))
+	}
+	for _, candidate := range rejected {
+		jobs, listErr := svc.listByRequest(candidate.RequestID)
+		if listErr != nil || len(jobs) != 0 {
+			return fmt.Errorf("queue_full request %q already owns durable state: jobs=%+v err=%v", candidate.RequestID, jobs, listErr)
+		}
+	}
+	status, raw, err = svc.requestJSON(http.MethodPost, "/v1/admin/compact", nil)
+	if err != nil || status != http.StatusOK {
+		return fmt.Errorf("compact with rejected admissions status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	}
+	for _, candidate := range rejected {
+		jobs, listErr := svc.listByRequest(candidate.RequestID)
+		if listErr != nil || len(jobs) != 0 {
+			return fmt.Errorf("compact materialized queue_full request %q: jobs=%+v err=%v", candidate.RequestID, jobs, listErr)
+		}
+	}
+
+	if _, err := blockingWriter.Write(blockingPayload); err != nil {
+		return err
+	}
+	if err := blockingWriter.Close(); err != nil {
+		return err
+	}
+	blockingWriter = nil
+	blockedJob, err := waitTerminal(svc, blocked.Job.ID, 12*time.Second)
+	if err != nil || blockedJob.Status != "succeeded" {
+		return fmt.Errorf("queue blocker completion=%+v err=%v", blockedJob, err)
+	}
+	for _, id := range acceptedIDs {
+		completed, waitErr := waitTerminal(svc, id, 12*time.Second)
+		if waitErr != nil || completed.Status != "succeeded" {
+			return fmt.Errorf("admitted queued job %q completion=%+v err=%v", id, completed, waitErr)
+		}
+	}
+
+	status, immediate, raw, err := svc.submit(rejected[0])
+	if err != nil || status != http.StatusAccepted || immediate.Existing || immediate.Job.ID == "" {
+		return fmt.Errorf("queue_full retry did not become first acceptance: status=%d result=%+v err=%v body=%s", status, immediate, err, strings.TrimSpace(string(raw)))
+	}
+	immediateJob, err := waitTerminal(svc, immediate.Job.ID, 8*time.Second)
+	if err != nil || immediateJob.Status != "succeeded" {
+		return fmt.Errorf("queue_full retry completion=%+v err=%v", immediateJob, err)
+	}
+	remaining, err := svc.listByRequest(rejected[1].RequestID)
+	if err != nil || len(remaining) != 0 {
+		return fmt.Errorf("untouched queue_full request became visible: jobs=%+v err=%v", remaining, err)
+	}
+	status, raw, err = svc.requestJSON(http.MethodPost, "/v1/admin/compact", nil)
+	if err != nil || status != http.StatusOK {
+		return fmt.Errorf("compact before queue restart status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	}
+	if err := svc.stop(); err != nil {
+		return err
+	}
+
+	address, err := reserveAddress()
+	if err != nil {
+		return err
+	}
+	cfg.Listen = address
+	if err := writeJSON(configPath, cfg); err != nil {
+		return err
+	}
+	restarted, err := startService(v.binDir, configPath, cfg.Listen, filepath.Join(directory, "logs-two"))
+	if err != nil {
+		return err
+	}
+	defer restarted.kill()
+	remaining, err = restarted.listByRequest(rejected[1].RequestID)
+	if err != nil || len(remaining) != 0 {
+		return fmt.Errorf("queue_full request survived restart: jobs=%+v err=%v", remaining, err)
+	}
+	status, afterRestart, raw, err := restarted.submit(rejected[1])
+	if err != nil || status != http.StatusAccepted || afterRestart.Existing || afterRestart.Job.ID == "" {
+		return fmt.Errorf("post-restart queue_full retry status=%d result=%+v err=%v body=%s", status, afterRestart, err, strings.TrimSpace(string(raw)))
+	}
+	afterRestartJob, err := waitTerminal(restarted, afterRestart.Job.ID, 8*time.Second)
+	if err != nil || afterRestartJob.Status != "succeeded" {
+		return fmt.Errorf("post-restart queue retry completion=%+v err=%v", afterRestartJob, err)
 	}
 	if err := restarted.stop(); err != nil {
 		return err

@@ -111,10 +111,18 @@ retries, and restart recovery.
 For this contract, normalized `manifest` and `destination` mean exactly the
 strings produced by the existing `JobSpec` validation: trim leading and
 trailing Unicode whitespace and perform no `filepath.Clean`, absolutization,
-symlink resolution, or case folding. The first valid submission is the first
-synchronous HTTP/`JobSpec` validation that is accepted with HTTP 202. A later
-asynchronous manifest or chunk publication failure still owns its
-`request_id`; a duplicate cannot replace that job's inputs.
+symlink resolution, or case folding. Resolving an omitted `max_attempts` from
+the current configuration is also part of synchronous validation and the
+resulting effective integer participates in the idempotency comparison.
+
+Queue admission is part of the synchronous HTTP 202 acceptance boundary. If a
+validated new submission cannot enter the bounded work queue, return HTTP 503
+with error code `queue_full`; do not append a `job_submitted` event, create or
+list a job, increment the accepted-job state, or claim its `request_id`. A later
+retry may therefore become the first accepted submission and return HTTP 202.
+Once a submission has returned HTTP 202, later asynchronous manifest or chunk
+publication failure does not release its `request_id`, and a duplicate cannot
+replace that job's inputs.
 
 Termination at any point after artifact publication, including between the
 durable success and receipt writes, must recover without reclassifying the job
