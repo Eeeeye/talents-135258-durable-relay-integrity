@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -21,11 +20,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 type verifier struct {
@@ -34,6 +33,205 @@ type verifier struct {
 	seed   int64
 	rng    *rand.Rand
 	rngMu  sync.Mutex
+}
+
+var (
+	activeCandidateUID uint32 = 200000
+	activeCandidateGID uint32 = 200000
+	managedPIDsMu      sync.Mutex
+	managedPIDs        = make(map[int]struct{})
+)
+
+func setCandidateIdentity(index int) {
+	activeCandidateUID = uint32(200000 + index)
+	activeCandidateGID = activeCandidateUID
+}
+
+func candidateProcessAttributes() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{
+		Setpgid:   true,
+		Pdeathsig: syscall.SIGKILL,
+		Credential: &syscall.Credential{
+			Uid:         activeCandidateUID,
+			Gid:         activeCandidateGID,
+			NoSetGroups: true,
+		},
+	}
+}
+
+func signalProcessGroup(pid int, signal syscall.Signal) {
+	if pid > 0 {
+		_ = syscall.Kill(-pid, signal)
+	}
+}
+
+func registerManagedPID(pid int) {
+	managedPIDsMu.Lock()
+	managedPIDs[pid] = struct{}{}
+	managedPIDsMu.Unlock()
+}
+
+func unregisterManagedPID(pid int) {
+	managedPIDsMu.Lock()
+	delete(managedPIDs, pid)
+	managedPIDsMu.Unlock()
+}
+
+func isManagedPID(pid int) bool {
+	managedPIDsMu.Lock()
+	_, ok := managedPIDs[pid]
+	managedPIDsMu.Unlock()
+	return ok
+}
+
+const prSetChildSubreaper = 36
+
+func enableChildSubreaper() error {
+	_, _, errno := syscall.RawSyscall6(syscall.SYS_PRCTL, prSetChildSubreaper, 1, 0, 0, 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func directCandidateChildren(uid uint32) ([]int, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	parentPID := os.Getpid()
+	var matches []int
+	for _, entry := range entries {
+		pid, parseErr := strconv.Atoi(entry.Name())
+		if parseErr != nil || pid <= 0 {
+			continue
+		}
+		if isManagedPID(pid) {
+			continue
+		}
+		raw, readErr := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+		if errors.Is(readErr, os.ErrNotExist) {
+			continue
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+		processParent := -1
+		var processUID uint64
+		uidFound := false
+		for _, line := range strings.Split(string(raw), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			switch fields[0] {
+			case "PPid:":
+				processParent, _ = strconv.Atoi(fields[1])
+			case "Uid:":
+				processUID, parseErr = strconv.ParseUint(fields[1], 10, 32)
+				uidFound = parseErr == nil
+			}
+		}
+		if processParent == parentPID && uidFound && uint32(processUID) == uid {
+			matches = append(matches, pid)
+		}
+	}
+	return matches, nil
+}
+
+func cleanupCandidateDescendants(uid uint32) error {
+	// The verifier is a child subreaper. Once the directly managed command is
+	// gone, even a double-forked or setsid(2) descendant is adopted here. Kill
+	// only those children whose UID belongs to this scenario, then repeat as
+	// deeper descendants are reparented. No system-wide UID sweep is used.
+	for attempt := 0; attempt < 50; attempt++ {
+		pids, err := directCandidateChildren(uid)
+		if err != nil {
+			return err
+		}
+		if len(pids) == 0 {
+			return nil
+		}
+		for _, pid := range pids {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			_, _ = syscall.Wait4(pid, nil, syscall.WNOHANG, nil)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	pids, err := directCandidateChildren(uid)
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("candidate descendants survived cleanup: uid=%d pids=%v", uid, pids)
+}
+
+func prepareVerifierRoot(path string) error {
+	if err := os.Chown(path, 0, 0); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o711)
+}
+
+func prepareTestDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chown(path, 0, int(activeCandidateGID)); err != nil {
+		return err
+	}
+	// The candidate may create its state and destination subdirectories but
+	// cannot list the verifier directory or remove root-owned inputs.
+	return os.Chmod(path, os.ModeSticky|0o730)
+}
+
+func prepareCandidateReadableDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chown(path, 0, int(activeCandidateGID)); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o710)
+}
+
+func writeCandidateReadableFile(path string, raw []byte) error {
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return err
+	}
+	if err := os.Chown(path, 0, int(activeCandidateGID)); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o640)
+}
+
+func prepareCandidateWritableDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chown(path, int(activeCandidateUID), int(activeCandidateGID)); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o700)
+}
+
+func prepareCandidateWritableTree(root string) error {
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := os.Chown(path, int(activeCandidateUID), int(activeCandidateGID)); err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return os.Chmod(path, 0o700)
+		}
+		return os.Chmod(path, 0o600)
+	})
 }
 
 type configFile struct {
@@ -200,7 +398,7 @@ func writeJSON(path string, value any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, raw, 0o600)
+	return writeCandidateReadableFile(path, raw)
 }
 
 func reserveAddress() (string, error) {
@@ -216,6 +414,9 @@ func reserveAddress() (string, error) {
 }
 
 func (v *verifier) prepareConfig(directory string, cfg configFile) (string, configFile, error) {
+	if err := prepareTestDirectory(directory); err != nil {
+		return "", configFile{}, err
+	}
 	address, err := reserveAddress()
 	if err != nil {
 		return "", configFile{}, err
@@ -234,7 +435,10 @@ func (v *verifier) prepareConfig(directory string, cfg configFile) (string, conf
 func (v *verifier) makeFixture(directory, label string, chunks [][]byte) (fixture, error) {
 	root := filepath.Join(directory, label)
 	chunkDir := filepath.Join(root, "chunks with spaces")
-	if err := os.MkdirAll(chunkDir, 0o700); err != nil {
+	if err := prepareCandidateReadableDirectory(root); err != nil {
+		return fixture{}, err
+	}
+	if err := prepareCandidateReadableDirectory(chunkDir); err != nil {
 		return fixture{}, err
 	}
 	manifest := manifestFile{Version: 1}
@@ -244,7 +448,7 @@ func (v *verifier) makeFixture(directory, label string, chunks [][]byte) (fixtur
 	for index, data := range chunks {
 		name := filepath.Join("chunks with spaces", fmt.Sprintf("part %03d.bin", index))
 		absolute := filepath.Join(root, name)
-		if err := os.WriteFile(absolute, data, 0o600); err != nil {
+		if err := writeCandidateReadableFile(absolute, data); err != nil {
 			return fixture{}, err
 		}
 		digest := sha256.Sum256(data)
@@ -271,12 +475,18 @@ func (v *verifier) makeFixture(directory, label string, chunks [][]byte) (fixtur
 
 func (v *verifier) makeFIFOFixture(directory, label string, payload []byte) (fixture, string, error) {
 	root := filepath.Join(directory, label)
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	if err := prepareCandidateReadableDirectory(root); err != nil {
 		return fixture{}, "", err
 	}
 	fifoName := "blocking chunk.bin"
 	fifoPath := filepath.Join(root, fifoName)
 	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		return fixture{}, "", err
+	}
+	if err := os.Chown(fifoPath, 0, int(activeCandidateGID)); err != nil {
+		return fixture{}, "", err
+	}
+	if err := os.Chmod(fifoPath, 0o640); err != nil {
 		return fixture{}, "", err
 	}
 	digest := sha256.Sum256(payload)
@@ -300,19 +510,20 @@ func (v *verifier) makeFIFOFixture(directory, label string, payload []byte) (fix
 }
 
 type service struct {
-	addr       string
-	cmd        *exec.Cmd
-	done       chan error
-	stderrPath string
-	mu         sync.Mutex
-	finished   bool
-	waitErr    error
+	addr         string
+	cmd          *exec.Cmd
+	done         chan error
+	stderrPath   string
+	candidateUID uint32
+	mu           sync.Mutex
+	finished     bool
+	waitErr      error
 }
 
 func startService(binDir, configPath string, cfg *configFile, logDir string) (*service, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		svc, err := startServiceAttempt(binDir, configPath, cfg.Listen, logDir)
+		svc, err := startServiceAttempt(binDir, configPath, cfg.Listen, cfg.StateDir, logDir)
 		if err == nil {
 			return svc, nil
 		}
@@ -333,8 +544,17 @@ func startService(binDir, configPath string, cfg *configFile, logDir string) (*s
 	return nil, fmt.Errorf("relayqd startup exhausted address retries: %w", lastErr)
 }
 
-func startServiceAttempt(binDir, configPath, address, logDir string) (*service, error) {
+func startServiceAttempt(binDir, configPath, address, stateDir, logDir string) (*service, error) {
+	if err := prepareCandidateWritableTree(stateDir); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chown(logDir, 0, 0); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(logDir, 0o700); err != nil {
 		return nil, err
 	}
 	stdoutPath := filepath.Join(logDir, "relayqd.stdout.log")
@@ -351,14 +571,21 @@ func startServiceAttempt(binDir, configPath, address, logDir string) (*service, 
 	cmd := exec.Command(filepath.Join(binDir, "relayqd"), "-config", configPath, "-log-level", "debug")
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	cmd.SysProcAttr = candidateProcessAttributes()
 	if err := cmd.Start(); err != nil {
 		_ = stdout.Close()
 		_ = stderr.Close()
 		return nil, err
 	}
-	svc := &service{addr: address, cmd: cmd, done: make(chan error, 1), stderrPath: stderrPath}
+	registerManagedPID(cmd.Process.Pid)
+	svc := &service{
+		addr: address, cmd: cmd, done: make(chan error, 1), stderrPath: stderrPath,
+		candidateUID: activeCandidateUID,
+	}
 	go func() {
 		err := cmd.Wait()
+		unregisterManagedPID(cmd.Process.Pid)
+		signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
 		_ = stdout.Close()
 		_ = stderr.Close()
 		svc.done <- err
@@ -393,33 +620,54 @@ func startServiceAttempt(binDir, configPath, address, logDir string) (*service, 
 	return nil, fmt.Errorf("relayqd did not become ready: %s", strings.TrimSpace(string(raw)))
 }
 
-func runCLI(timeout time.Duration, path string, arguments ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, path, arguments...)
-	output, err := cmd.CombinedOutput()
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return output, fmt.Errorf("command timed out: %s %s", path, strings.Join(arguments, " "))
+func runCLI(timeout time.Duration, path string, arguments ...string) (result []byte, resultErr error) {
+	candidateUID := activeCandidateUID
+	defer func() {
+		resultErr = errors.Join(resultErr, cleanupCandidateDescendants(candidateUID))
+	}()
+	cmd := exec.Command(path, arguments...)
+	cmd.SysProcAttr = candidateProcessAttributes()
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	registerManagedPID(cmd.Process.Pid)
+	done := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		unregisterManagedPID(cmd.Process.Pid)
+		done <- err
+	}()
+	var err error
+	select {
+	case err = <-done:
+		signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
+	case <-time.After(timeout):
+		signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
+		<-done
+		return output.Bytes(), fmt.Errorf("command timed out: %s %s", path, strings.Join(arguments, " "))
 	}
 	if err != nil {
-		return output, fmt.Errorf("command failed: %s %s: %w: %s", path, strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
+		return output.Bytes(), fmt.Errorf("command failed: %s %s: %w: %s", path, strings.Join(arguments, " "), err, strings.TrimSpace(output.String()))
 	}
-	return output, nil
+	return output.Bytes(), nil
 }
 
 func setProcessFileSizeLimit(pid int, limit uint64) error {
-	value := syscall.Rlimit{Cur: limit, Max: limit}
-	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_PRLIMIT64,
-		uintptr(pid),
-		uintptr(syscall.RLIMIT_FSIZE),
-		uintptr(unsafe.Pointer(&value)),
-		0,
-		0,
-		0,
-	)
-	if errno != 0 {
-		return errno
+	// The verifier intentionally runs as root while relayqd runs under a fresh
+	// unprivileged identity for every scenario. Docker's default capability set
+	// does not let that root process use prlimit(2) across UIDs. Execute the
+	// trusted util-linux helper as relayqd's own UID instead; same-UID prlimit is
+	// permitted and the helper can affect only the explicitly named candidate
+	// PID. The candidate cannot replace this root-owned binary.
+	value := fmt.Sprintf("%d:%d", limit, limit)
+	cmd := exec.Command("/usr/bin/prlimit", "--pid", fmt.Sprint(pid), "--fsize="+value)
+	cmd.SysProcAttr = candidateProcessAttributes()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("candidate-owned prlimit failed: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
@@ -454,29 +702,29 @@ func (s *service) stop() error {
 	s.mu.Unlock()
 	if finished {
 		waitErr, _ := s.await(0)
-		return waitErr
+		signalProcessGroup(s.cmd.Process.Pid, syscall.SIGKILL)
+		return errors.Join(waitErr, cleanupCandidateDescendants(s.candidateUID))
 	}
-	if err := s.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		return err
-	}
+	signalProcessGroup(s.cmd.Process.Pid, syscall.SIGTERM)
 	waitErr, err := s.await(5 * time.Second)
 	if err != nil {
-		_ = s.cmd.Process.Kill()
+		signalProcessGroup(s.cmd.Process.Pid, syscall.SIGKILL)
 		_, _ = s.await(2 * time.Second)
-		return err
+		return errors.Join(err, cleanupCandidateDescendants(s.candidateUID))
 	}
-	return waitErr
+	signalProcessGroup(s.cmd.Process.Pid, syscall.SIGKILL)
+	return errors.Join(waitErr, cleanupCandidateDescendants(s.candidateUID))
 }
 
 func (s *service) kill() {
+	signalProcessGroup(s.cmd.Process.Pid, syscall.SIGKILL)
 	s.mu.Lock()
 	finished := s.finished
 	s.mu.Unlock()
-	if finished {
-		return
+	if !finished {
+		_, _ = s.await(2 * time.Second)
 	}
-	_ = s.cmd.Process.Kill()
-	_, _ = s.await(2 * time.Second)
+	_ = cleanupCandidateDescendants(s.candidateUID)
 }
 
 func (s *service) requestRaw(method, path, contentType string, body []byte) (int, []byte, error) {
@@ -627,6 +875,35 @@ func readReceipts(path string) ([]receipt, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+func assertExactReceipts(path string, expected []job) error {
+	receipts, err := readReceipts(path)
+	if err != nil {
+		return err
+	}
+	for _, wanted := range expected {
+		if wanted.Status != "succeeded" || wanted.CompletedAt.IsZero() {
+			return fmt.Errorf("cannot require receipt for incomplete job: %+v", wanted)
+		}
+		matches := 0
+		for _, observed := range receipts {
+			if observed.JobID != wanted.ID && observed.RequestID != wanted.Spec.RequestID {
+				continue
+			}
+			matches++
+			if observed.Version != 1 || observed.JobID != wanted.ID ||
+				observed.RequestID != wanted.Spec.RequestID || observed.Destination != wanted.Spec.Destination ||
+				observed.ArtifactSize != wanted.ArtifactSize || observed.ArtifactSHA256 != wanted.ArtifactSHA ||
+				!observed.CompletedAt.Equal(wanted.CompletedAt) {
+				return fmt.Errorf("receipt differs from durable completion: receipt=%+v job=%+v", observed, wanted)
+			}
+		}
+		if matches != 1 {
+			return fmt.Errorf("job %q request %q has %d receipts, expected exactly one", wanted.ID, wanted.Spec.RequestID, matches)
+		}
+	}
+	return nil
 }
 
 type durableSnapshot struct {
@@ -933,7 +1210,7 @@ func directoryNames(path string) ([]string, error) {
 }
 
 func copyTree(source, destination string) error {
-	return filepath.Walk(source, func(path string, info os.FileInfo, walkErr error) error {
+	if err := filepath.Walk(source, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -963,10 +1240,16 @@ func copyTree(source, destination string) error {
 			return copyErr
 		}
 		return closeErr
-	})
+	}); err != nil {
+		return err
+	}
+	return prepareCandidateWritableTree(destination)
 }
 
 func expectStartupFailure(binDir, configPath string, cfg *configFile, timeout time.Duration) (string, error) {
+	if err := prepareCandidateWritableTree(cfg.StateDir); err != nil {
+		return "", err
+	}
 	for attempt := 0; attempt < 3; attempt++ {
 		output, err := expectStartupFailureAttempt(binDir, configPath, cfg.Listen, timeout)
 		if err != nil || !strings.Contains(strings.ToLower(output), "address already in use") {
@@ -986,6 +1269,7 @@ func expectStartupFailure(binDir, configPath string, cfg *configFile, timeout ti
 
 func expectStartupFailureAttempt(binDir, configPath, address string, timeout time.Duration) (string, error) {
 	cmd := exec.Command(filepath.Join(binDir, "relayqd"), "-config", configPath, "-log-level", "error")
+	cmd.SysProcAttr = candidateProcessAttributes()
 	var combined bytes.Buffer
 	cmd.Stdout = &combined
 	cmd.Stderr = &combined
@@ -998,6 +1282,7 @@ func expectStartupFailureAttempt(binDir, configPath, address string, timeout tim
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-done:
+			signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
 			if err == nil {
 				return combined.String(), errors.New("relayqd unexpectedly exited zero on corrupt state")
 			}
@@ -1015,14 +1300,14 @@ func expectStartupFailureAttempt(binDir, configPath, address string, timeout tim
 			_ = response.Body.Close()
 			var value health
 			if response.StatusCode == http.StatusOK && json.Unmarshal(raw, &value) == nil && value.Ready {
-				_ = cmd.Process.Kill()
+				signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
 				<-done
 				return combined.String(), errors.New("relayqd reported ready on corrupt state")
 			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	_ = cmd.Process.Kill()
+	signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
 	<-done
 	return combined.String(), errors.New("relayqd remained running on corrupt state")
 }

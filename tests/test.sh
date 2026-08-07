@@ -4,8 +4,16 @@ set -Eeuo pipefail
 umask 077
 install -d -m 0755 /logs/verifier
 reward=0
+unit_group_pid=""
+cleanup_unit_group() {
+    if [[ -n "${unit_group_pid}" ]]; then
+        kill -KILL -- "-${unit_group_pid}" >/dev/null 2>&1 || true
+        wait "${unit_group_pid}" >/dev/null 2>&1 || true
+        unit_group_pid=""
+    fi
+}
 finish() {
-    /usr/bin/pkill -KILL -u 65534 >/dev/null 2>&1 || true
+    cleanup_unit_group
     printf '%s\n' "${reward}" > /logs/verifier/reward.txt
     chmod 0644 /logs/verifier/reward.txt
 }
@@ -31,36 +39,49 @@ cd /app
 /usr/local/go/bin/go build -trimpath -buildvcs=false -o "${bin_dir}/relayfixture" ./cmd/relayfixture
 /usr/local/go/bin/go build -trimpath -buildvcs=false -o "${bin_dir}/relayinspect" ./cmd/relayinspect
 
-# Candidate tests are code execution. Freeze the trusted sources and freshly
-# built binaries before allowing that code to run, then execute it without
-# privileges or access to verifier outputs.
+# Freeze the trusted sources and freshly built binaries before executing any
+# candidate-controlled code.
 chown -R 0:0 /app "${work_dir}"
 chmod -R go-w /app "${work_dir}"
 # Harbor may already provide /tests as a read-only root-owned mount. Tighten
-# it when writable; the precompiled verifier remains authoritative either way.
-chown -R 0:0 /tests >/dev/null 2>&1 || true
-chmod -R go-w /tests >/dev/null 2>&1 || true
-chmod 0555 "${work_dir}" "${bin_dir}" "${work_dir}/verifier" "${bin_dir}"/*
+# it before untrusted code runs. The verifier is already compiled, so candidate
+# tests and binaries never need to read this source tree.
+chown -R 0:0 /tests
+chmod -R u=rwX,go= /tests
+chmod 0711 "${work_dir}" "${bin_dir}"
+chmod 0500 "${work_dir}/verifier"
+chmod 0555 "${bin_dir}"/*
+
+# Run the trusted integration phase first. Candidate tests are arbitrary code;
+# placing them last prevents a detached test process from observing or racing
+# verifier-created services, fixtures, state, or timing windows.
+"${work_dir}/verifier" -bin-dir "${bin_dir}" \
+    > /logs/verifier/integration.log 2>&1
 
 candidate_cache="${work_dir}/candidate-gocache"
 candidate_gopath="${work_dir}/candidate-gopath"
 candidate_tmp="${work_dir}/candidate-tmp"
-install -d -m 0700 -o 65534 -g 65534 "${candidate_cache}" "${candidate_gopath}" "${candidate_tmp}"
+candidate_unit_uid=199999
+candidate_unit_gid=199999
+install -d -m 0700 -o "${candidate_unit_uid}" -g "${candidate_unit_gid}" \
+    "${candidate_cache}" "${candidate_gopath}" "${candidate_tmp}"
 
-/usr/bin/setpriv \
-    --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
+set +e
+/usr/bin/setsid /usr/bin/setpriv \
+    --reuid="${candidate_unit_uid}" --regid="${candidate_unit_gid}" --clear-groups --no-new-privs \
     /usr/bin/env GOCACHE="${candidate_cache}" GOPATH="${candidate_gopath}" TMPDIR="${candidate_tmp}" \
     /usr/local/go/bin/go test -buildvcs=false -count=1 ./... \
-    > /logs/verifier/unit-tests.log 2>&1
+    > /logs/verifier/unit-tests.log 2>&1 &
+unit_group_pid=$!
+wait "${unit_group_pid}"
+unit_status=$?
+set -e
+cleanup_unit_group
+if (( unit_status != 0 )); then
+    cat /logs/verifier/unit-tests.log
+    exit "${unit_status}"
+fi
 
-# A candidate test must not be able to leave a process racing the trusted
-# integration phase after go test has returned.
-/usr/bin/pkill -KILL -u 65534 >/dev/null 2>&1 || true
-
-/usr/bin/setpriv \
-    --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
-    "${work_dir}/verifier" -bin-dir "${bin_dir}" \
-    > /logs/verifier/integration.log 2>&1
-cat /logs/verifier/unit-tests.log
 cat /logs/verifier/integration.log
+cat /logs/verifier/unit-tests.log
 reward=1

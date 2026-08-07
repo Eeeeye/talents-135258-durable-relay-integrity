@@ -26,6 +26,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "verifier: -bin-dir is required")
 		os.Exit(2)
 	}
+	if os.Geteuid() != 0 {
+		fmt.Fprintln(os.Stderr, "verifier: trusted integration verifier must run as root so candidate processes can use isolated UIDs")
+		os.Exit(2)
+	}
+	if err := enableChildSubreaper(); err != nil {
+		fmt.Fprintf(os.Stderr, "verifier: become candidate child subreaper: %v\n", err)
+		os.Exit(2)
+	}
 	seed, err := verifierSeed()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "verifier: choose seed: %v\n", err)
@@ -34,6 +42,10 @@ func main() {
 	root, err := os.MkdirTemp("", "durable-relay-integration-")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "verifier: temp root: %v\n", err)
+		os.Exit(2)
+	}
+	if err := prepareVerifierRoot(root); err != nil {
+		fmt.Fprintf(os.Stderr, "verifier: protect temp root: %v\n", err)
 		os.Exit(2)
 	}
 	if os.Getenv("DURABLE_RELAY_KEEP_TMP") == "" {
@@ -47,6 +59,7 @@ func main() {
 		name string
 		run  func(*verifier) error
 	}{
+		{"candidate-process-containment", testCandidateProcessContainment},
 		{"public-cli-compatibility", testPublicCLICompatibility},
 		{"ordinary-and-atomic-publication", testOrdinaryAndAtomicPublication},
 		{"strict-http-contract", testStrictHTTPContract},
@@ -54,22 +67,48 @@ func main() {
 		{"queue-admission-ownership", testQueueAdmissionOwnership},
 		{"success-receipt-crash-recovery", testSuccessReceiptCrashRecovery},
 		{"transactional-live-reload", testTransactionalReload},
+		{"periodic-snapshot-and-listener-policy", testPeriodicSnapshotAndListenerPolicy},
 		{"concurrent-wal-compaction-restart", testConcurrentWALCompaction},
 		{"corrupt-state-fails-closed", testCorruptionFailsClosed},
 	}
 
 	fmt.Printf("verifier seed=%d root=%s\n", seed, root)
-	for _, test := range tests {
+	for index, test := range tests {
+		setCandidateIdentity(index)
 		started := time.Now()
-		fmt.Printf("RUN  %s\n", test.name)
-		if err := test.run(v); err != nil {
-			fmt.Printf("FAIL %s (%s): %v\n", test.name, time.Since(started).Round(time.Millisecond), err)
+		fmt.Printf("RUN  %s candidate_uid=%d\n", test.name, activeCandidateUID)
+		testErr := test.run(v)
+		cleanupErr := cleanupCandidateDescendants(activeCandidateUID)
+		if testErr != nil || cleanupErr != nil {
+			fmt.Printf("FAIL %s (%s): %v\n", test.name, time.Since(started).Round(time.Millisecond), errors.Join(testErr, cleanupErr))
 			fmt.Printf("reproduce with DURABLE_RELAY_TEST_SEED=%d\n", seed)
 			os.Exit(1)
 		}
 		fmt.Printf("PASS %s (%s)\n", test.name, time.Since(started).Round(time.Millisecond))
 	}
 	fmt.Printf("all integration checks passed; seed=%d\n", seed)
+}
+
+func testCandidateProcessContainment(v *verifier) error {
+	directory := filepath.Join(v.root, "candidate process containment")
+	if err := prepareTestDirectory(directory); err != nil {
+		return err
+	}
+	marker := filepath.Join(directory, "escaped-child-marker")
+	// Deliberately escape the command's process group and let the immediate
+	// shell exit. As a child subreaper, the verifier must adopt and terminate
+	// the detached descendant before it can write after runCLI returns.
+	script := `/usr/bin/setsid /bin/sh -c 'sleep 0.25; : > "$1"' marker-writer "$1" >/dev/null 2>&1 &`
+	if output, err := runCLI(2*time.Second, "/bin/sh", "-c", script, "launcher", marker); err != nil {
+		return fmt.Errorf("launch detached containment probe: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	time.Sleep(350 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		return errors.New("detached candidate descendant survived process-group and subreaper cleanup")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func testPublicCLICompatibility(v *verifier) error {
@@ -147,6 +186,7 @@ func testPublicCLICompatibility(v *verifier) error {
 	if err := json.Unmarshal(waitOutput, &completed); err != nil || completed.Status != "succeeded" || completed.ID != submitted.Job.ID {
 		return fmt.Errorf("relayctl wait output=%s err=%v", strings.TrimSpace(string(waitOutput)), err)
 	}
+	completedJobs := []job{completed}
 	for _, invocation := range [][]string{
 		{"get", "-id", submitted.Job.ID},
 		{"list", "-request", requestID},
@@ -202,6 +242,7 @@ func testPublicCLICompatibility(v *verifier) error {
 		if err != nil || value.Status != "succeeded" {
 			return fmt.Errorf("relayctl flood job %q completion=%+v err=%v", id, value, err)
 		}
+		completedJobs = append(completedJobs, value)
 	}
 	if _, err := ctl("compact"); err != nil {
 		return err
@@ -219,6 +260,9 @@ func testPublicCLICompatibility(v *verifier) error {
 	}
 	if err := json.Unmarshal(snapshotOutput, &snapshotSummary); err != nil || !snapshotSummary.Exists || snapshotSummary.LastSequence == 0 || snapshotSummary.Jobs != 3 {
 		return fmt.Errorf("relayinspect snapshot output=%s err=%v", strings.TrimSpace(string(snapshotOutput)), err)
+	}
+	if err := assertExactReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"), completedJobs); err != nil {
+		return fmt.Errorf("CLI completion receipts: %w", err)
 	}
 	if err := svc.stop(); err != nil {
 		return err
@@ -318,7 +362,7 @@ func testOrdinaryAndAtomicPublication(v *verifier) error {
 		return err
 	}
 	existingDir := filepath.Join(directory, "existing destination")
-	if err := os.MkdirAll(existingDir, 0o700); err != nil {
+	if err := prepareCandidateWritableDirectory(existingDir); err != nil {
 		return err
 	}
 	existingDestination := filepath.Join(existingDir, "preserve me.bin")
@@ -355,7 +399,7 @@ func testOrdinaryAndAtomicPublication(v *verifier) error {
 	}
 	corruptBytes := append([]byte(nil), corrupt.ChunkData[1]...)
 	corruptBytes[len(corruptBytes)/2] ^= 0x80
-	if err := os.WriteFile(corrupt.ChunkPaths[1], corruptBytes, 0o600); err != nil {
+	if err := writeCandidateReadableFile(corrupt.ChunkPaths[1], corruptBytes); err != nil {
 		return err
 	}
 	absentDir := filepath.Join(directory, "absent destination")
@@ -380,6 +424,9 @@ func testOrdinaryAndAtomicPublication(v *verifier) error {
 	entries, err = directoryNames(absentDir)
 	if err != nil || len(entries) != 0 {
 		return fmt.Errorf("publication temp residue beside absent target: entries=%v err=%v", entries, err)
+	}
+	if err := assertExactReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"), []job{completed, zeroJob}); err != nil {
+		return fmt.Errorf("ordinary completion receipts: %w", err)
 	}
 
 	if err := svc.stop(); err != nil {
@@ -630,30 +677,17 @@ func testDurableIdempotency(v *verifier) error {
 	if err != nil || len(listed) != 1 || listed[0].ID != jobID {
 		return fmt.Errorf("idempotent list=%+v err=%v", listed, err)
 	}
-	receipts, err := readReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"))
-	if err != nil {
-		return err
-	}
-	count := 0
-	for _, value := range receipts {
-		if value.RequestID == spec.RequestID {
-			count++
-			if value.JobID != jobID || value.ArtifactSHA256 != generated.ArtifactSHA {
-				return fmt.Errorf("idempotent receipt mismatch: %+v", value)
-			}
-		}
-	}
-	if count != 1 {
-		return fmt.Errorf("idempotent request has %d receipts, expected 1", count)
+	if err := assertExactReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"), []job{completed}); err != nil {
+		return fmt.Errorf("idempotent completion receipt: %w", err)
 	}
 
 	manifestLexicalDir := filepath.Join(generated.Dir, "lexical segment")
 	destinationDir := filepath.Dir(spec.Destination)
 	destinationLexicalDir := filepath.Join(destinationDir, "lexical segment")
-	if err := os.MkdirAll(manifestLexicalDir, 0o700); err != nil {
+	if err := prepareCandidateReadableDirectory(manifestLexicalDir); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(destinationLexicalDir, 0o700); err != nil {
+	if err := prepareCandidateWritableDirectory(destinationLexicalDir); err != nil {
 		return err
 	}
 	destinationLink := filepath.Join(directory, "archive symlink")
@@ -748,18 +782,12 @@ func testDurableIdempotency(v *verifier) error {
 	if err := checkMatrix("after restart", restarted); err != nil {
 		return err
 	}
-	receipts, err = readReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"))
+	recovered, err := restarted.getJob(jobID)
 	if err != nil {
 		return err
 	}
-	count = 0
-	for _, value := range receipts {
-		if value.RequestID == spec.RequestID {
-			count++
-		}
-	}
-	if count != 1 {
-		return fmt.Errorf("restart changed receipt count to %d", count)
+	if err := assertExactReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"), []job{recovered}); err != nil {
+		return fmt.Errorf("restarted idempotent completion receipt: %w", err)
 	}
 	if err := restarted.stop(); err != nil {
 		return err
@@ -910,11 +938,13 @@ func testQueueAdmissionOwnership(v *verifier) error {
 	if err != nil || blockedJob.Status != "succeeded" {
 		return fmt.Errorf("queue blocker completion=%+v err=%v", blockedJob, err)
 	}
+	completedJobs := []job{blockedJob}
 	for _, id := range acceptedIDs {
 		completed, waitErr := waitTerminal(svc, id, 12*time.Second)
 		if waitErr != nil || completed.Status != "succeeded" {
 			return fmt.Errorf("admitted queued job %q completion=%+v err=%v", id, completed, waitErr)
 		}
+		completedJobs = append(completedJobs, completed)
 	}
 
 	status, immediate, raw, err := svc.submit(rejected[0])
@@ -925,6 +955,7 @@ func testQueueAdmissionOwnership(v *verifier) error {
 	if err != nil || immediateJob.Status != "succeeded" {
 		return fmt.Errorf("queue_full retry completion=%+v err=%v", immediateJob, err)
 	}
+	completedJobs = append(completedJobs, immediateJob)
 	remaining, err := svc.listByRequest(rejected[1].RequestID)
 	if err != nil || len(remaining) != 0 {
 		return fmt.Errorf("untouched queue_full request became visible: jobs=%+v err=%v", remaining, err)
@@ -962,6 +993,10 @@ func testQueueAdmissionOwnership(v *verifier) error {
 	if err != nil || afterRestartJob.Status != "succeeded" {
 		return fmt.Errorf("post-restart queue retry completion=%+v err=%v", afterRestartJob, err)
 	}
+	completedJobs = append(completedJobs, afterRestartJob)
+	if err := assertExactReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"), completedJobs); err != nil {
+		return fmt.Errorf("queue admission completion receipts: %w", err)
+	}
 	if err := restarted.stop(); err != nil {
 		return err
 	}
@@ -981,7 +1016,7 @@ func testSuccessReceiptCrashRecovery(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+	if err := prepareCandidateWritableDirectory(cfg.StateDir); err != nil {
 		return err
 	}
 	// Make the receipt ledger much larger than the WAL before relayqd opens it.
@@ -1184,6 +1219,9 @@ func testSuccessReceiptCrashRecovery(v *verifier) error {
 	}
 	if count != 1 {
 		return fmt.Errorf("receipt-edge recovery produced %d receipts", count)
+	}
+	if err := assertExactReceipts(receiptPath, []job{recovered}); err != nil {
+		return fmt.Errorf("receipt-edge exact completion: %w", err)
 	}
 	if err := restarted.stop(); err != nil {
 		return err
@@ -1390,7 +1428,7 @@ func testTransactionalReload(v *verifier) error {
 	}
 
 	unchangedWorkers := updated
-	unchangedWorkers.RetryBaseMS = v.intBetween(80, 160)
+	unchangedWorkers.RetryBaseMS = v.intBetween(90, 110)
 	unchangedWorkers.MaxAttempts = v.intBetween(7, 10)
 	unchangedWorkers.MaxRequestBytes = int64(v.intBetween(9000, 12000))
 	if err := writeJSON(configPath, unchangedWorkers); err != nil {
@@ -1484,6 +1522,7 @@ func testTransactionalReload(v *verifier) error {
 	if err := release(thirdOpened); err != nil {
 		return err
 	}
+	reloadCompleted := make([]job, 0, 5)
 	for _, id := range []string{firstSubmit.Job.ID, secondSubmit.Job.ID, thirdSubmit.Job.ID} {
 		value, err := waitTerminal(svc, id, 5*time.Second)
 		if err != nil {
@@ -1492,44 +1531,78 @@ func testTransactionalReload(v *verifier) error {
 		if value.Status != "succeeded" {
 			return fmt.Errorf("FIFO job failed after reload: %+v", value)
 		}
+		reloadCompleted = append(reloadCompleted, value)
 	}
 
-	retryData := v.bytes(7777)
-	retryFixture, err := v.makeFixture(directory, "retry fixture", [][]byte{retryData})
+	verifyRetryTiming := func(label string, current configFile, upperSlack time.Duration) (job, fixture, error) {
+		retryData := v.bytes(7777)
+		retryFixture, fixtureErr := v.makeFixture(directory, label+" fixture", [][]byte{retryData})
+		if fixtureErr != nil {
+			return job{}, fixture{}, fixtureErr
+		}
+		if removeErr := os.Remove(retryFixture.ChunkPaths[0]); removeErr != nil {
+			return job{}, fixture{}, removeErr
+		}
+		retryStatus, retrySubmit, retryRaw, submitErr := svc.submit(jobSpec{
+			RequestID: v.token(label), Manifest: retryFixture.Manifest,
+			Destination: filepath.Join(directory, "retry archive", label+".bin"),
+		})
+		if submitErr != nil || retryStatus != http.StatusAccepted {
+			return job{}, fixture{}, fmt.Errorf("%s submit status=%d err=%v body=%s", label, retryStatus, submitErr, strings.TrimSpace(string(retryRaw)))
+		}
+		retrying, waitErr := waitForJob(svc, retrySubmit.Job.ID, 2*time.Second, func(value job) bool {
+			return value.Status == "retry_wait" && value.Attempts == 1
+		})
+		if waitErr != nil {
+			return job{}, fixture{}, waitErr
+		}
+		if retrying.Spec.MaxAttempts != current.MaxAttempts {
+			return job{}, fixture{}, fmt.Errorf("%s did not use reloaded default max_attempts: %+v", label, retrying.Spec)
+		}
+		observedAt := time.Now()
+		if writeErr := writeCandidateReadableFile(retryFixture.ChunkPaths[0], retryData); writeErr != nil {
+			return job{}, fixture{}, writeErr
+		}
+		minimum := time.Duration(current.RetryBaseMS) * time.Millisecond / 2
+		maximum := time.Duration(current.RetryBaseMS)*time.Millisecond + upperSlack
+		retried, terminalErr := waitTerminal(svc, retrySubmit.Job.ID, maximum)
+		elapsed := time.Since(observedAt)
+		if terminalErr != nil {
+			return job{}, fixture{}, fmt.Errorf("%s retry_base_ms=%d exceeded %s: %w", label, current.RetryBaseMS, maximum, terminalErr)
+		}
+		if retried.Status != "succeeded" || retried.Attempts != 2 || elapsed < minimum || elapsed >= maximum {
+			return job{}, fixture{}, fmt.Errorf("%s retry timing outside [%s,%s): job=%+v elapsed=%s", label, minimum, maximum, retried, elapsed)
+		}
+		return retried, retryFixture, nil
+	}
+
+	fastRetry, retryFixture, err := verifyRetryTiming("reload-retry-fast", scaledDown, 300*time.Millisecond)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(retryFixture.ChunkPaths[0]); err != nil {
+	reloadCompleted = append(reloadCompleted, fastRetry)
+
+	slowerRetryConfig := scaledDown
+	slowerRetryConfig.RetryBaseMS = v.intBetween(320, 380)
+	if err := writeJSON(configPath, slowerRetryConfig); err != nil {
 		return err
 	}
-	status, retrySubmit, raw, err := svc.submit(jobSpec{
-		RequestID: v.token("reload-retry"), Manifest: retryFixture.Manifest,
-		Destination: filepath.Join(directory, "retry archive", "retry.bin"),
-	})
-	if err != nil || status != http.StatusAccepted {
-		return fmt.Errorf("retry submit status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	status, raw, err = svc.requestJSON(http.MethodPost, "/v1/admin/reload", nil)
+	if err != nil || status != http.StatusOK {
+		return fmt.Errorf("second retry-base reload status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
 	}
-	retrying, err := waitForJob(svc, retrySubmit.Job.ID, 1*time.Second, func(value job) bool {
-		return value.Status == "retry_wait" && value.Attempts >= 1
-	})
+	slowerStats, err := svc.readStats()
 	if err != nil {
 		return err
 	}
-	if retrying.Spec.MaxAttempts != scaledDown.MaxAttempts {
-		return fmt.Errorf("new default max_attempts not applied: %+v", retrying.Spec)
+	if slowerStats.Config != (configSnapshot{Generation: 5, configFile: slowerRetryConfig}) || slowerStats.Runtime.ActiveWorkerLimit != 1 {
+		return fmt.Errorf("second retry-base reload not coherent: %+v", slowerStats)
 	}
-	retryStarted := time.Now()
-	if err := os.WriteFile(retryFixture.ChunkPaths[0], retryData, 0o600); err != nil {
+	slowRetry, _, err := verifyRetryTiming("reload-retry-slow", slowerRetryConfig, 350*time.Millisecond)
+	if err != nil {
 		return err
 	}
-	retryBudget := time.Duration(scaledDown.RetryBaseMS)*4*time.Millisecond + 500*time.Millisecond
-	retried, err := waitTerminal(svc, retrySubmit.Job.ID, retryBudget)
-	if err != nil {
-		return fmt.Errorf("new retry_base_ms=%d was not live within %s: %w", scaledDown.RetryBaseMS, retryBudget, err)
-	}
-	if retried.Status != "succeeded" || time.Since(retryStarted) >= retryBudget {
-		return fmt.Errorf("retried job mismatch: %+v elapsed=%s", retried, time.Since(retryStarted))
-	}
+	reloadCompleted = append(reloadCompleted, slowRetry)
 
 	boundarySpec := jobSpec{
 		RequestID: v.token("reload-size-within"), Manifest: retryFixture.Manifest,
@@ -1539,26 +1612,26 @@ func testTransactionalReload(v *verifier) error {
 	if err != nil {
 		return err
 	}
-	withinPadding := int(scaledDown.MaxRequestBytes) - len(baseRaw) - 64
+	withinPadding := int(slowerRetryConfig.MaxRequestBytes) - len(baseRaw) - 64
 	if withinPadding < 1 {
-		return fmt.Errorf("randomized max_request_bytes is too small for boundary probe: %d", scaledDown.MaxRequestBytes)
+		return fmt.Errorf("randomized max_request_bytes is too small for boundary probe: %d", slowerRetryConfig.MaxRequestBytes)
 	}
 	boundarySpec.Destination = strings.Repeat("d", withinPadding)
 	withinRaw, err := json.Marshal(boundarySpec)
 	if err != nil {
 		return err
 	}
-	if int64(len(withinRaw)) >= scaledDown.MaxRequestBytes {
-		return fmt.Errorf("within-limit probe length=%d limit=%d", len(withinRaw), scaledDown.MaxRequestBytes)
+	if int64(len(withinRaw)) >= slowerRetryConfig.MaxRequestBytes {
+		return fmt.Errorf("within-limit probe length=%d limit=%d", len(withinRaw), slowerRetryConfig.MaxRequestBytes)
 	}
 	status, _, raw, err = svc.submit(boundarySpec)
 	if err != nil || status != http.StatusAccepted {
 		return fmt.Errorf("reloaded max_request_bytes rejected within-limit request: size=%d limit=%d status=%d err=%v body=%s",
-			len(withinRaw), scaledDown.MaxRequestBytes, status, err, strings.TrimSpace(string(raw)))
+			len(withinRaw), slowerRetryConfig.MaxRequestBytes, status, err, strings.TrimSpace(string(raw)))
 	}
 	overSpec := boundarySpec
 	overSpec.RequestID = v.token("reload-size-over")
-	overSpec.Destination = strings.Repeat("d", int(scaledDown.MaxRequestBytes)+512)
+	overSpec.Destination = strings.Repeat("d", int(slowerRetryConfig.MaxRequestBytes)+512)
 	oversized, err := json.Marshal(overSpec)
 	if err != nil {
 		return err
@@ -1566,9 +1639,212 @@ func testTransactionalReload(v *verifier) error {
 	status, raw, err = svc.requestRaw(http.MethodPost, "/v1/jobs", "application/json", oversized)
 	if err != nil || status != http.StatusBadRequest {
 		return fmt.Errorf("reloaded max_request_bytes=%d not enforced for size=%d: status=%d err=%v body=%s",
-			scaledDown.MaxRequestBytes, len(oversized), status, err, strings.TrimSpace(string(raw)))
+			slowerRetryConfig.MaxRequestBytes, len(oversized), status, err, strings.TrimSpace(string(raw)))
+	}
+	if err := assertExactReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"), reloadCompleted); err != nil {
+		return fmt.Errorf("reload completion receipts: %w", err)
 	}
 	if err := svc.stop(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func testPeriodicSnapshotAndListenerPolicy(v *verifier) error {
+	directory := filepath.Join(v.root, "periodic snapshot listener")
+	if err := prepareTestDirectory(directory); err != nil {
+		return err
+	}
+
+	portBase := v.intBetween(20000, 45000)
+	for index, listen := range []string{
+		fmt.Sprintf("0.0.0.0:%d", portBase),
+		fmt.Sprintf("[::]:%d", portBase+1),
+		fmt.Sprintf("localhost:%d", portBase+2),
+	} {
+		caseDirectory := filepath.Join(directory, fmt.Sprintf("listener case %d", index))
+		if err := prepareTestDirectory(caseDirectory); err != nil {
+			return err
+		}
+		candidate := baseConfig()
+		candidate.Listen = listen
+		candidate.StateDir = filepath.Join(caseDirectory, "state")
+		configPath := filepath.Join(caseDirectory, "relay.json")
+		if err := writeJSON(configPath, candidate); err != nil {
+			return err
+		}
+		output, err := expectStartupFailure(v.binDir, configPath, &candidate, 1500*time.Millisecond)
+		if err != nil {
+			return fmt.Errorf("non-loopback listener %q did not fail closed: %w output=%s", listen, err, strings.TrimSpace(output))
+		}
+		if !strings.Contains(strings.ToLower(output), "loopback") {
+			return fmt.Errorf("non-loopback listener %q failed for the wrong reason: %s", listen, strings.TrimSpace(output))
+		}
+	}
+
+	periodicDirectory := filepath.Join(directory, "automatic compaction")
+	cfg := baseConfig()
+	cfg.WorkerCount = 4
+	cfg.SyncWAL = true
+	cfg.SnapshotIntervalMS = v.intBetween(70, 110)
+	configPath, cfg, err := v.prepareConfig(periodicDirectory, cfg)
+	if err != nil {
+		return err
+	}
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(periodicDirectory, "logs-one"))
+	if err != nil {
+		return err
+	}
+	defer svc.kill()
+
+	snapshotPath := filepath.Join(cfg.StateDir, "snapshot.json")
+	type periodicObservation struct {
+		reads       int
+		seen        bool
+		maxSequence uint64
+		err         error
+	}
+	observerStop := make(chan struct{})
+	observerResult := make(chan periodicObservation, 1)
+	var observerStopOnce sync.Once
+	stopObserver := func() { observerStopOnce.Do(func() { close(observerStop) }) }
+	defer stopObserver()
+	go func() {
+		result := periodicObservation{}
+		var previous uint64
+		for {
+			select {
+			case <-observerStop:
+				observerResult <- result
+				return
+			default:
+			}
+			observed, exists, readErr := readSnapshot(snapshotPath)
+			result.reads++
+			if readErr != nil {
+				result.err = fmt.Errorf("automatic snapshot was partially visible: %w", readErr)
+				observerResult <- result
+				return
+			}
+			if result.seen && !exists {
+				result.err = errors.New("automatic snapshot disappeared after becoming visible")
+				observerResult <- result
+				return
+			}
+			if exists {
+				result.seen = true
+				if observed.LastSequence < previous {
+					result.err = fmt.Errorf("automatic snapshot sequence regressed %d -> %d", previous, observed.LastSequence)
+					observerResult <- result
+					return
+				}
+				previous = observed.LastSequence
+				if observed.LastSequence > result.maxSequence {
+					result.maxSequence = observed.LastSequence
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	generated, err := v.makeFixture(periodicDirectory, "periodic fixture", [][]byte{v.bytes(2051), v.bytes(3073)})
+	if err != nil {
+		return err
+	}
+	const count = 16
+	completed := make([]job, 0, count)
+	for index := 0; index < count; index++ {
+		status, submitted, raw, submitErr := svc.submit(jobSpec{
+			RequestID:   v.token(fmt.Sprintf("periodic-%02d", index)),
+			Manifest:    generated.Manifest,
+			Destination: filepath.Join(periodicDirectory, "archive", fmt.Sprintf("artifact-%02d.bin", index)),
+			MaxAttempts: 2,
+		})
+		if submitErr != nil || status != http.StatusAccepted {
+			return fmt.Errorf("periodic submit %d status=%d err=%v body=%s", index, status, submitErr, strings.TrimSpace(string(raw)))
+		}
+		value, waitErr := waitTerminal(svc, submitted.Job.ID, 8*time.Second)
+		if waitErr != nil || value.Status != "succeeded" {
+			return fmt.Errorf("periodic job %d completion=%+v err=%v", index, value, waitErr)
+		}
+		completed = append(completed, value)
+	}
+	targetStats, err := svc.readStats()
+	if err != nil {
+		return err
+	}
+	targetSequence := targetStats.LastSequence
+	deadline := time.Now().Add(4 * time.Second)
+	var automaticSnapshot durableSnapshot
+	for time.Now().Before(deadline) {
+		currentStats, statsErr := svc.readStats()
+		observed, exists, snapshotErr := readSnapshot(snapshotPath)
+		if statsErr == nil && snapshotErr == nil && exists && currentStats.Runtime.Snapshots >= 2 && observed.LastSequence >= targetSequence {
+			automaticSnapshot = observed
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if automaticSnapshot.LastSequence < targetSequence {
+		return fmt.Errorf("periodic compactor did not snapshot target sequence %d: snapshot=%+v", targetSequence, automaticSnapshot)
+	}
+	stopObserver()
+	observation := <-observerResult
+	if observation.err != nil {
+		return observation.err
+	}
+	if !observation.seen || observation.reads < 5 || observation.maxSequence < targetSequence {
+		return fmt.Errorf("automatic snapshot observer did not overlap publication: %+v target=%d", observation, targetSequence)
+	}
+	if err := assertExactReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"), completed); err != nil {
+		return fmt.Errorf("periodic completion receipts: %w", err)
+	}
+	if err := svc.stop(); err != nil {
+		return err
+	}
+
+	finalSnapshot, exists, err := readSnapshot(snapshotPath)
+	if err != nil || !exists {
+		return fmt.Errorf("automatic snapshot unavailable after shutdown: exists=%v err=%v", exists, err)
+	}
+	scan, err := scanWAL(filepath.Join(cfg.StateDir, "events.wal"), finalSnapshot.LastSequence)
+	if err != nil {
+		return fmt.Errorf("automatic snapshot WAL sequence: %w", err)
+	}
+	durableJobs, err := replayDurableState(finalSnapshot, scan)
+	if err != nil {
+		return fmt.Errorf("automatic snapshot durable replay: %w", err)
+	}
+	if len(durableJobs) != count {
+		return fmt.Errorf("automatic snapshot replay has %d jobs, expected %d", len(durableJobs), count)
+	}
+	for index, value := range completed {
+		durable, ok := durableJobs[value.ID]
+		if !ok || !sameDurableJob(durable, value) {
+			return fmt.Errorf("automatic snapshot lost job %d: durable=%+v completed=%+v", index, durable, value)
+		}
+	}
+
+	address, err := reserveAddress()
+	if err != nil {
+		return err
+	}
+	cfg.Listen = address
+	if err := writeJSON(configPath, cfg); err != nil {
+		return err
+	}
+	restarted, err := startService(v.binDir, configPath, &cfg, filepath.Join(periodicDirectory, "logs-two"))
+	if err != nil {
+		return fmt.Errorf("restart after automatic snapshot: %w", err)
+	}
+	defer restarted.kill()
+	for index, value := range completed {
+		jobs, listErr := restarted.listByRequest(value.Spec.RequestID)
+		if listErr != nil || len(jobs) != 1 || !sameDurableJob(jobs[0], value) {
+			return fmt.Errorf("automatic snapshot recovery job %d jobs=%+v err=%v", index, jobs, listErr)
+		}
+	}
+	if err := restarted.stop(); err != nil {
 		return err
 	}
 	return nil
@@ -1793,21 +2069,13 @@ func testConcurrentWALCompaction(v *verifier) error {
 	if err != nil || len(sentinelJobs) != 1 || !sameDurableJob(sentinelJobs[0], durableJobs[sentinelSubmit.Job.ID]) {
 		return fmt.Errorf("recovered sentinel jobs=%+v err=%v", sentinelJobs, err)
 	}
-	receipts, err := readReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"))
-	if err != nil {
-		return err
+	expectedReceipts := make([]job, 0, count+1)
+	for _, outcome := range outcomes {
+		expectedReceipts = append(expectedReceipts, durableJobs[outcome.jobID])
 	}
-	seen := make(map[string]int)
-	for _, value := range receipts {
-		seen[value.RequestID]++
-	}
-	for index, outcome := range outcomes {
-		if seen[outcome.requestID] != 1 {
-			return fmt.Errorf("bulk request %d receipt count=%d", index, seen[outcome.requestID])
-		}
-	}
-	if seen[sentinelRequest] != 1 {
-		return fmt.Errorf("sentinel receipt count=%d", seen[sentinelRequest])
+	expectedReceipts = append(expectedReceipts, durableJobs[sentinelSubmit.Job.ID])
+	if err := assertExactReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"), expectedReceipts); err != nil {
+		return fmt.Errorf("concurrent compaction completion receipts: %w", err)
 	}
 	if err := restarted.stop(); err != nil {
 		return err
@@ -1862,6 +2130,9 @@ func testCorruptionFailsClosed(v *verifier) error {
 	secondCompleted, err := waitTerminal(svc, secondSubmit.Job.ID, 5*time.Second)
 	if err != nil || secondCompleted.Status != "succeeded" {
 		return fmt.Errorf("post-snapshot source completion=%+v err=%v", secondCompleted, err)
+	}
+	if err := assertExactReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"), []job{completed, secondCompleted}); err != nil {
+		return fmt.Errorf("corruption source completion receipts: %w", err)
 	}
 	if err := svc.stop(); err != nil {
 		return err
@@ -2054,6 +2325,9 @@ func testCorruptionFailsClosed(v *verifier) error {
 	}
 	for _, item := range cases {
 		caseDir := filepath.Join(directory, item.name)
+		if err := prepareTestDirectory(caseDir); err != nil {
+			return err
+		}
 		stateDir := filepath.Join(caseDir, "state")
 		if err := copyTree(cfg.StateDir, stateDir); err != nil {
 			return err

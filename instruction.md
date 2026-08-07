@@ -152,9 +152,9 @@ request IDs, hashes, counts, or timing values.
 ## 7. Working and acceptance conditions
 
 Work inside `/app`. You may modify source, candidate-visible tests, and build
-files there. Do not alter `/tests` or verifier logs. The environment has no
-Internet access and requires no new dependency; use the Go standard library and
-normal Linux filesystem/process facilities.
+files there. Do not alter `/tests` or verifier logs. The repaired relay must
+build and operate without Internet access or network-fetched dependencies; use
+the Go standard library and normal Linux filesystem/process facilities.
 
 At minimum, keep these commands passing:
 

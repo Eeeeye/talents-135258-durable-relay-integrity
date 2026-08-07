@@ -9,6 +9,8 @@ keywords = ["go", "durability", "wal", "concurrency", "idempotency", "atomic-fil
 [metadata]
 difficulty = "hard"
 difficulty_explanation = "L4: a human expert must establish one coherent acceptance and durability order across HTTP admission, Unicode-normalized idempotency, concurrent WAL sequencing, snapshot rotation, atomic filesystem publication, receipts, live reload, and crash recovery. An agent must diagnose interacting failures across these layers from black-box symptoms, preserve the public wire and DRW1 formats, reject tempting local fixes that introduce new crash windows, and validate nondeterministic concurrency and restart behavior without network access or new dependencies."
+category = "systems-engineering"
+tags = ["go", "durability", "wal", "concurrency", "idempotency", "atomic-files"]
 activity_id = "135258"
 source_sha256 = "872791c69307abb76f1b1facfa2b93da3c071a7a8d20eba5ff3712dd1ccf6a94"
 expert_time_estimate_min = 240.0
@@ -24,5 +26,5 @@ build_timeout_sec = 600.0
 cpus = 4
 memory_mb = 4096
 storage_mb = 8192
-allow_internet = false
+allow_internet = true
 workdir = "/app"
