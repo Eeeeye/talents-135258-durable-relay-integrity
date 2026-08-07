@@ -82,16 +82,19 @@ not acceptable.
 
 Before changing the requested final destination, validate every chunk's
 existence, size, and lowercase SHA-256 as well as the total artifact size and
-SHA-256. Any error or cancellation must:
+SHA-256. Any validation or assembly error, or any cancellation observed before
+the atomic replacement commit point, must:
 
 - leave an absent destination absent;
 - preserve a pre-existing destination byte-for-byte; and
 - leave no abandoned publication temporary file in the destination directory.
 
 On success, publish the exact concatenated bytes using a same-directory atomic
-replacement and make the file and containing directory durable before reporting
-success. Paths containing spaces are ordinary paths. A manifest containing one
-or more zero-length chunks and an empty artifact is valid.
+replacement and report success only after that replacement completes. The
+replacement is the publication commit point: cancellation before it takes the
+failure path, while cancellation observed after it does not retroactively undo
+the committed artifact. Paths containing spaces are ordinary paths. A manifest
+containing one or more zero-length chunks and an empty artifact is valid.
 
 ## 5. Durable request idempotency and exactly-one receipt
 

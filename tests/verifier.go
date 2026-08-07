@@ -71,6 +71,7 @@ func main() {
 		{"transactional-live-reload", testTransactionalReload},
 		{"periodic-snapshot-and-listener-policy", testPeriodicSnapshotAndListenerPolicy},
 		{"concurrent-wal-compaction-restart", testConcurrentWALCompaction},
+		{"compaction-crash-with-nonterminal-jobs", testCompactionCrashRecovery},
 		{"corrupt-state-fails-closed", testCorruptionFailsClosed},
 	}
 
@@ -431,8 +432,134 @@ func testOrdinaryAndAtomicPublication(v *verifier) error {
 		return fmt.Errorf("ordinary completion receipts: %w", err)
 	}
 
-	if err := svc.stop(); err != nil {
-		return fmt.Errorf("ordinary service shutdown: %w", err)
+	// Hold two valid publications inside their final chunk reads, then request a
+	// graceful shutdown. Once the listener closes, Engine.Close has no HTTP work
+	// left to drain and cancels the publishers. Releasing the FIFO data after that
+	// point distinguishes a real pre-commit cancellation check from an
+	// implementation that blindly finishes and replaces the destination.
+	type cancellationCase struct {
+		label          string
+		fixture        fixture
+		fifo           string
+		destination    string
+		sentinel       []byte
+		hadDestination bool
+		jobID          string
+	}
+	cancellationCases := make([]cancellationCase, 2)
+	for index := range cancellationCases {
+		label := fmt.Sprintf("cancel-%d", index)
+		payload := v.bytes(32<<10 + index*4093)
+		generated, fifoPath, fixtureErr := v.makeFIFOFixture(directory, label+" fixture", payload)
+		if fixtureErr != nil {
+			return fixtureErr
+		}
+		destinationDirectory := filepath.Join(directory, label+" destination")
+		if err := prepareCandidateWritableDirectory(destinationDirectory); err != nil {
+			return err
+		}
+		item := cancellationCase{
+			label: label, fixture: generated, fifo: fifoPath,
+			destination: filepath.Join(destinationDirectory, "artifact.bin"),
+		}
+		if index == 0 {
+			item.hadDestination = true
+			item.sentinel = append([]byte("cancellation-sentinel:"), v.bytes(211)...)
+			if err := os.WriteFile(item.destination, item.sentinel, 0o640); err != nil {
+				return err
+			}
+		}
+		status, result, raw, submitErr := svc.submit(jobSpec{
+			RequestID: v.token(label), Manifest: generated.Manifest,
+			Destination: item.destination, MaxAttempts: 2,
+		})
+		if submitErr != nil || status != http.StatusAccepted || result.Job.ID == "" {
+			return fmt.Errorf("%s submit status=%d err=%v body=%s", label, status, submitErr, strings.TrimSpace(string(raw)))
+		}
+		item.jobID = result.Job.ID
+		cancellationCases[index] = item
+	}
+
+	openedWriters := make(chan fifoOpenResult, len(cancellationCases))
+	for _, item := range cancellationCases {
+		go func(path string) {
+			file, openErr := os.OpenFile(path, os.O_WRONLY, 0)
+			openedWriters <- fifoOpenResult{path: path, file: file, err: openErr}
+		}(item.fifo)
+	}
+	writers := make(map[string]*os.File, len(cancellationCases))
+	for range cancellationCases {
+		select {
+		case opened := <-openedWriters:
+			if opened.err != nil {
+				return opened.err
+			}
+			writers[opened.path] = opened.file
+		case <-time.After(3 * time.Second):
+			return errors.New("publishers did not enter the controlled cancellation fixtures")
+		}
+	}
+
+	signalProcessGroup(svc.cmd.Process.Pid, syscall.SIGTERM)
+	listenerDeadline := time.Now().Add(2 * time.Second)
+	for {
+		_, _, healthErr := svc.requestJSON(http.MethodGet, "/v1/health", nil)
+		if healthErr != nil {
+			break
+		}
+		if time.Now().After(listenerDeadline) {
+			return errors.New("relay listener did not close after cancellation signal")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// http.Server.Shutdown closes the listener before Engine.Close cancels the
+	// engine context. Leave a small scheduling allowance for that adjacent call.
+	time.Sleep(50 * time.Millisecond)
+	for _, item := range cancellationCases {
+		writer := writers[item.fifo]
+		if _, err := writer.Write(item.fixture.Artifact); err != nil {
+			_ = writer.Close()
+			return fmt.Errorf("release %s cancellation fixture: %w", item.label, err)
+		}
+		if err := writer.Close(); err != nil {
+			return fmt.Errorf("close %s cancellation fixture: %w", item.label, err)
+		}
+	}
+	waitErr, awaitErr := svc.await(5 * time.Second)
+	if awaitErr != nil || waitErr != nil {
+		return fmt.Errorf("cancelled service exit: %v", errors.Join(waitErr, awaitErr))
+	}
+	for _, item := range cancellationCases {
+		if item.hadDestination {
+			observed, err := os.ReadFile(item.destination)
+			if err != nil || !bytes.Equal(observed, item.sentinel) {
+				return fmt.Errorf("%s cancellation changed existing destination: bytes=%d err=%v", item.label, len(observed), err)
+			}
+		} else if _, err := os.Stat(item.destination); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%s cancellation created absent destination: %v", item.label, err)
+		}
+		names, err := directoryNames(filepath.Dir(item.destination))
+		expectedEntries := 0
+		if item.hadDestination {
+			expectedEntries = 1
+		}
+		if err != nil || len(names) != expectedEntries || (expectedEntries == 1 && names[0] != filepath.Base(item.destination)) {
+			return fmt.Errorf("%s cancellation left publication residue: entries=%v err=%v", item.label, names, err)
+		}
+	}
+	receipts, err := readReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"))
+	if err != nil {
+		return err
+	}
+	if len(receipts) != 2 {
+		return fmt.Errorf("cancellation changed successful receipt count: %d", len(receipts))
+	}
+	for _, receipt := range receipts {
+		for _, item := range cancellationCases {
+			if receipt.JobID == item.jobID {
+				return fmt.Errorf("cancelled job wrote a success receipt: %+v", receipt)
+			}
+		}
 	}
 	return nil
 }
@@ -1498,9 +1625,10 @@ func testSuccessReceiptCrashRecovery(v *verifier) error {
 }
 
 type fifoOpenResult struct {
-	path string
-	file *os.File
-	err  error
+	path     string
+	file     *os.File
+	openedAt time.Time
+	err      error
 }
 
 func assertRejectedReload(svc *service, configPath, label string, candidate []byte) error {
@@ -1543,7 +1671,7 @@ func testTransactionalReload(v *verifier) error {
 	}
 	cfg := baseConfig()
 	cfg.WorkerCount = 1
-	cfg.RetryBaseMS = 1000
+	cfg.RetryBaseMS = 1800
 	cfg.MaxAttempts = 2
 	configPath, cfg, err := v.prepareConfig(directory, cfg)
 	if err != nil {
@@ -1696,7 +1824,7 @@ func testTransactionalReload(v *verifier) error {
 	}
 
 	unchangedWorkers := updated
-	unchangedWorkers.RetryBaseMS = v.intBetween(90, 110)
+	unchangedWorkers.RetryBaseMS = v.intBetween(600, 650)
 	unchangedWorkers.MaxAttempts = v.intBetween(7, 10)
 	unchangedWorkers.MaxRequestBytes = int64(v.intBetween(9000, 12000))
 	if err := writeJSON(configPath, unchangedWorkers); err != nil {
@@ -1804,12 +1932,9 @@ func testTransactionalReload(v *verifier) error {
 
 	verifyRetryTiming := func(label string, current configFile, upperSlack time.Duration) (job, fixture, error) {
 		retryData := v.bytes(7777)
-		retryFixture, fixtureErr := v.makeFixture(directory, label+" fixture", [][]byte{retryData})
+		retryFixture, chunkPath, fixtureErr := v.makeFIFOFixture(directory, label+" fixture", retryData)
 		if fixtureErr != nil {
 			return job{}, fixture{}, fixtureErr
-		}
-		if removeErr := os.Remove(retryFixture.ChunkPaths[0]); removeErr != nil {
-			return job{}, fixture{}, removeErr
 		}
 		retryStatus, retrySubmit, retryRaw, submitErr := svc.submit(jobSpec{
 			RequestID: v.token(label), Manifest: retryFixture.Manifest,
@@ -1818,6 +1943,30 @@ func testTransactionalReload(v *verifier) error {
 		if submitErr != nil || retryStatus != http.StatusAccepted {
 			return job{}, fixture{}, fmt.Errorf("%s submit status=%d err=%v body=%s", label, retryStatus, submitErr, strings.TrimSpace(string(retryRaw)))
 		}
+		firstWriterResult := make(chan fifoOpenResult, 1)
+		go func() {
+			file, openErr := os.OpenFile(chunkPath, os.O_WRONLY, 0)
+			firstWriterResult <- fifoOpenResult{path: chunkPath, file: file, openedAt: time.Now(), err: openErr}
+		}()
+		var firstWriter fifoOpenResult
+		select {
+		case firstWriter = <-firstWriterResult:
+		case <-time.After(3 * time.Second):
+			return job{}, fixture{}, fmt.Errorf("%s first attempt did not open the controlled chunk", label)
+		}
+		if firstWriter.err != nil {
+			return job{}, fixture{}, firstWriter.err
+		}
+		corrupt := append([]byte(nil), retryData...)
+		corrupt[len(corrupt)/2] ^= 0x80
+		if _, writeErr := firstWriter.file.Write(corrupt); writeErr != nil {
+			_ = firstWriter.file.Close()
+			return job{}, fixture{}, writeErr
+		}
+		if closeErr := firstWriter.file.Close(); closeErr != nil {
+			return job{}, fixture{}, closeErr
+		}
+		failureReleasedAt := time.Now()
 		retrying, waitErr := waitForJob(svc, retrySubmit.Job.ID, 2*time.Second, func(value job) bool {
 			return value.Status == "retry_wait" && value.Attempts == 1
 		})
@@ -1827,19 +1976,57 @@ func testTransactionalReload(v *verifier) error {
 		if retrying.Spec.MaxAttempts != current.MaxAttempts {
 			return job{}, fixture{}, fmt.Errorf("%s did not use reloaded default max_attempts: %+v", label, retrying.Spec)
 		}
-		observedAt := time.Now()
-		if writeErr := writeCandidateReadableFile(retryFixture.ChunkPaths[0], retryData); writeErr != nil {
+		if removeErr := os.Remove(chunkPath); removeErr != nil {
+			return job{}, fixture{}, removeErr
+		}
+		if fifoErr := syscall.Mkfifo(chunkPath, 0o600); fifoErr != nil {
+			return job{}, fixture{}, fifoErr
+		}
+		if chownErr := os.Chown(chunkPath, 0, int(activeCandidateGID)); chownErr != nil {
+			return job{}, fixture{}, chownErr
+		}
+		if chmodErr := os.Chmod(chunkPath, 0o640); chmodErr != nil {
+			return job{}, fixture{}, chmodErr
+		}
+		openedWriter := make(chan fifoOpenResult, 1)
+		go func() {
+			file, openErr := os.OpenFile(chunkPath, os.O_WRONLY, 0)
+			openedWriter <- fifoOpenResult{path: chunkPath, file: file, openedAt: time.Now(), err: openErr}
+		}()
+		base := time.Duration(current.RetryBaseMS) * time.Millisecond
+		minimum := base - 35*time.Millisecond
+		maximum := time.Duration(current.RetryBaseMS)*time.Millisecond + upperSlack
+		remaining := time.Until(failureReleasedAt.Add(maximum))
+		if remaining <= 0 {
+			return job{}, fixture{}, fmt.Errorf("%s exhausted retry observation window before FIFO setup", label)
+		}
+		var opened fifoOpenResult
+		select {
+		case opened = <-openedWriter:
+		case <-time.After(remaining):
+			return job{}, fixture{}, fmt.Errorf("%s retry did not reopen the controlled chunk within %s", label, maximum)
+		}
+		if opened.err != nil {
+			return job{}, fixture{}, opened.err
+		}
+		elapsed := opened.openedAt.Sub(failureReleasedAt)
+		if elapsed < minimum || elapsed >= maximum {
+			_ = opened.file.Close()
+			return job{}, fixture{}, fmt.Errorf("%s retry_base_ms=%d opened outside [%s,%s): elapsed=%s", label, current.RetryBaseMS, minimum, maximum, elapsed)
+		}
+		if _, writeErr := opened.file.Write(retryData); writeErr != nil {
+			_ = opened.file.Close()
 			return job{}, fixture{}, writeErr
 		}
-		minimum := time.Duration(current.RetryBaseMS) * time.Millisecond / 2
-		maximum := time.Duration(current.RetryBaseMS)*time.Millisecond + upperSlack
-		retried, terminalErr := waitTerminal(svc, retrySubmit.Job.ID, maximum)
-		elapsed := time.Since(observedAt)
-		if terminalErr != nil {
-			return job{}, fixture{}, fmt.Errorf("%s retry_base_ms=%d exceeded %s: %w", label, current.RetryBaseMS, maximum, terminalErr)
+		if closeErr := opened.file.Close(); closeErr != nil {
+			return job{}, fixture{}, closeErr
 		}
-		if retried.Status != "succeeded" || retried.Attempts != 2 || elapsed < minimum || elapsed >= maximum {
-			return job{}, fixture{}, fmt.Errorf("%s retry timing outside [%s,%s): job=%+v elapsed=%s", label, minimum, maximum, retried, elapsed)
+		retried, terminalErr := waitTerminal(svc, retrySubmit.Job.ID, 5*time.Second)
+		if terminalErr != nil {
+			return job{}, fixture{}, terminalErr
+		}
+		if retried.Status != "succeeded" || retried.Attempts != 2 {
+			return job{}, fixture{}, fmt.Errorf("%s retry completion mismatch: %+v", label, retried)
 		}
 		return retried, retryFixture, nil
 	}
@@ -1851,7 +2038,7 @@ func testTransactionalReload(v *verifier) error {
 	reloadCompleted = append(reloadCompleted, fastRetry)
 
 	slowerRetryConfig := scaledDown
-	slowerRetryConfig.RetryBaseMS = v.intBetween(320, 380)
+	slowerRetryConfig.RetryBaseMS = v.intBetween(1100, 1200)
 	if err := writeJSON(configPath, slowerRetryConfig); err != nil {
 		return err
 	}
@@ -2355,6 +2542,307 @@ func testConcurrentWALCompaction(v *verifier) error {
 	expectedReceipts = append(expectedReceipts, durableJobs[sentinelSubmit.Job.ID])
 	if err := assertExactReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"), expectedReceipts); err != nil {
 		return fmt.Errorf("concurrent compaction completion receipts: %w", err)
+	}
+	if err := restarted.stop(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func testCompactionCrashRecovery(v *verifier) error {
+	directory := filepath.Join(v.root, "compaction crash nonterminal")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	cfg := baseConfig()
+	cfg.WorkerCount = 1
+	cfg.QueueCapacity = 128
+	cfg.RetryBaseMS = 30000
+	cfg.MaxAttempts = 3
+	cfg.SyncWAL = true
+	configPath, cfg, err := v.prepareConfig(directory, cfg)
+	if err != nil {
+		return err
+	}
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-one"))
+	if err != nil {
+		return err
+	}
+	initialAlive := true
+	defer func() {
+		if initialAlive {
+			svc.kill()
+		}
+	}()
+
+	type acceptedRecord struct {
+		id               string
+		requestID        string
+		spec             jobSpec
+		artifact         []byte
+		artifactSHA      string
+		preCrashStatus   string
+		expectedAttempts int
+	}
+	records := make([]acceptedRecord, 0, 14)
+
+	retryPayload := v.bytes(12289)
+	retryFixture, err := v.makeFixture(directory, "crash retry fixture", [][]byte{retryPayload})
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(retryFixture.ChunkPaths[0]); err != nil {
+		return err
+	}
+	retrySpec := jobSpec{
+		RequestID: v.token("crash-retry"), Manifest: retryFixture.Manifest,
+		Destination: filepath.Join(directory, "recovered archive", "retry.bin"), MaxAttempts: 3,
+	}
+	status, retrySubmit, raw, err := svc.submit(retrySpec)
+	if err != nil || status != http.StatusAccepted || retrySubmit.Job.ID == "" {
+		return fmt.Errorf("crash retry submit status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	}
+	retrying, err := waitForJob(svc, retrySubmit.Job.ID, 3*time.Second, func(value job) bool {
+		return value.Status == "retry_wait" && value.Attempts == 1
+	})
+	if err != nil {
+		return err
+	}
+	if err := writeCandidateReadableFile(retryFixture.ChunkPaths[0], retryPayload); err != nil {
+		return err
+	}
+	records = append(records, acceptedRecord{
+		id: retrySubmit.Job.ID, requestID: retrySpec.RequestID, spec: retrySpec,
+		artifact: retryFixture.Artifact, artifactSHA: retryFixture.ArtifactSHA,
+		preCrashStatus: retrying.Status, expectedAttempts: 2,
+	})
+
+	blockedPayload := v.bytes(24593)
+	blockedFixture, blockedFIFO, err := v.makeFIFOFixture(directory, "crash running fixture", blockedPayload)
+	if err != nil {
+		return err
+	}
+	blockedSpec := jobSpec{
+		RequestID: v.token("crash-running"), Manifest: blockedFixture.Manifest,
+		Destination: filepath.Join(directory, "recovered archive", "running.bin"), MaxAttempts: 3,
+	}
+	status, blockedSubmit, raw, err := svc.submit(blockedSpec)
+	if err != nil || status != http.StatusAccepted || blockedSubmit.Job.ID == "" {
+		return fmt.Errorf("crash running submit status=%d err=%v body=%s", status, err, strings.TrimSpace(string(raw)))
+	}
+	blockedWriterResult := make(chan fifoOpenResult, 1)
+	go func() {
+		file, openErr := os.OpenFile(blockedFIFO, os.O_WRONLY, 0)
+		blockedWriterResult <- fifoOpenResult{path: blockedFIFO, file: file, openedAt: time.Now(), err: openErr}
+	}()
+	var blockedWriter *os.File
+	select {
+	case opened := <-blockedWriterResult:
+		if opened.err != nil {
+			return opened.err
+		}
+		blockedWriter = opened.file
+	case <-time.After(3 * time.Second):
+		return errors.New("worker did not enter the running crash fixture")
+	}
+	running, err := waitForJob(svc, blockedSubmit.Job.ID, 2*time.Second, func(value job) bool {
+		return value.Status == "running" && value.Attempts == 1
+	})
+	if err != nil {
+		_ = blockedWriter.Close()
+		return err
+	}
+	records = append(records, acceptedRecord{
+		id: blockedSubmit.Job.ID, requestID: blockedSpec.RequestID, spec: blockedSpec,
+		artifact: blockedFixture.Artifact, artifactSHA: blockedFixture.ArtifactSHA,
+		preCrashStatus: running.Status, expectedAttempts: 2,
+	})
+
+	compactProgress := make(chan int, 128)
+	compactDone := make(chan error, 1)
+	go func() {
+		for index := 0; index < 100; index++ {
+			compactStatus, compactRaw, compactErr := svc.requestJSON(http.MethodPost, "/v1/admin/compact", nil)
+			if compactErr != nil || compactStatus != http.StatusOK {
+				compactDone <- fmt.Errorf("crash compact %d status=%d err=%v body=%s", index, compactStatus, compactErr, strings.TrimSpace(string(compactRaw)))
+				return
+			}
+			compactProgress <- index + 1
+			time.Sleep(5 * time.Millisecond)
+		}
+		compactDone <- nil
+	}()
+	select {
+	case <-compactProgress:
+	case compactErr := <-compactDone:
+		_ = blockedWriter.Close()
+		return fmt.Errorf("compaction stopped before overlapping submissions: %w", compactErr)
+	case <-time.After(3 * time.Second):
+		_ = blockedWriter.Close()
+		return errors.New("compaction did not begin before pending submissions")
+	}
+
+	pendingFixture, err := v.makeFixture(directory, "crash pending fixture", [][]byte{v.bytes(4099), v.bytes(6151)})
+	if err != nil {
+		_ = blockedWriter.Close()
+		return err
+	}
+	const pendingCount = 12
+	for index := 0; index < pendingCount; index++ {
+		requestID := v.token(fmt.Sprintf("crash-pending-%02d", index))
+		spec := jobSpec{
+			RequestID: requestID, Manifest: pendingFixture.Manifest,
+			Destination: filepath.Join(directory, "recovered archive", fmt.Sprintf("pending-%02d.bin", index)), MaxAttempts: 3,
+		}
+		status, result, raw, submitErr := svc.submit(spec)
+		if submitErr != nil || status != http.StatusAccepted || result.Job.ID == "" {
+			_ = blockedWriter.Close()
+			return fmt.Errorf("crash pending %d submit status=%d err=%v body=%s", index, status, submitErr, strings.TrimSpace(string(raw)))
+		}
+		records = append(records, acceptedRecord{
+			id: result.Job.ID, requestID: requestID, spec: spec,
+			artifact: pendingFixture.Artifact, artifactSHA: pendingFixture.ArtifactSHA,
+			preCrashStatus: "pending", expectedAttempts: 1,
+		})
+	}
+
+	completedCompactions := 1
+	for completedCompactions < 3 {
+		select {
+		case <-compactProgress:
+			completedCompactions++
+		case compactErr := <-compactDone:
+			_ = blockedWriter.Close()
+			return fmt.Errorf("compaction stopped before crash window: %w", compactErr)
+		case <-time.After(3 * time.Second):
+			_ = blockedWriter.Close()
+			return fmt.Errorf("only %d compactions completed before crash", completedCompactions)
+		}
+	}
+
+	beforeKill := make(map[string]job, len(records))
+	statusCounts := make(map[string]int)
+	for _, record := range records {
+		value, readErr := svc.getJob(record.id)
+		if readErr != nil {
+			_ = blockedWriter.Close()
+			return readErr
+		}
+		if value.ID != record.id || value.Spec != record.spec || value.Status != record.preCrashStatus {
+			_ = blockedWriter.Close()
+			return fmt.Errorf("pre-crash job changed identity/spec/state: record=%+v job=%+v", record, value)
+		}
+		beforeKill[record.id] = value
+		statusCounts[value.Status]++
+	}
+	if statusCounts["retry_wait"] != 1 || statusCounts["running"] != 1 || statusCounts["pending"] != pendingCount {
+		_ = blockedWriter.Close()
+		return fmt.Errorf("crash window lacks required nonterminal states: %v", statusCounts)
+	}
+
+	svc.kill()
+	initialAlive = false
+	_ = blockedWriter.Close()
+	select {
+	case <-compactDone:
+	case <-time.After(6 * time.Second):
+		return errors.New("compaction request did not unwind after SIGKILL")
+	}
+
+	snapshotPath := filepath.Join(cfg.StateDir, "snapshot.json")
+	snapshot, exists, err := readSnapshot(snapshotPath)
+	if err != nil || !exists || snapshot.LastSequence == 0 {
+		return fmt.Errorf("crash snapshot invalid: exists=%v sequence=%d err=%v", exists, snapshot.LastSequence, err)
+	}
+	scan, err := scanWAL(filepath.Join(cfg.StateDir, "events.wal"), snapshot.LastSequence)
+	if err != nil {
+		return fmt.Errorf("scan post-crash WAL: %w", err)
+	}
+	durableJobs, err := replayDurableState(snapshot, scan)
+	if err != nil {
+		return fmt.Errorf("replay post-crash durable state: %w", err)
+	}
+	if len(durableJobs) != len(records) {
+		return fmt.Errorf("post-crash durable state contains %d jobs, expected %d", len(durableJobs), len(records))
+	}
+	for _, record := range records {
+		durable, ok := durableJobs[record.id]
+		if !ok || !sameDurableJob(durable, beforeKill[record.id]) {
+			return fmt.Errorf("accepted job lost or changed at compaction crash: id=%s durable=%+v before=%+v ok=%v", record.id, durable, beforeKill[record.id], ok)
+		}
+	}
+
+	address, err := reserveAddress()
+	if err != nil {
+		return err
+	}
+	cfg.Listen = address
+	if err := writeJSON(configPath, cfg); err != nil {
+		return err
+	}
+	restarted, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-two"))
+	if err != nil {
+		return fmt.Errorf("restart after compaction crash: %w", err)
+	}
+	defer restarted.kill()
+
+	recoveryWriterResult := make(chan fifoOpenResult, 1)
+	go func() {
+		file, openErr := os.OpenFile(blockedFIFO, os.O_WRONLY, 0)
+		recoveryWriterResult <- fifoOpenResult{path: blockedFIFO, file: file, openedAt: time.Now(), err: openErr}
+	}()
+	var recoveryWriter *os.File
+	select {
+	case opened := <-recoveryWriterResult:
+		if opened.err != nil {
+			return opened.err
+		}
+		recoveryWriter = opened.file
+	case <-time.After(5 * time.Second):
+		return errors.New("recovered running job never reopened its FIFO")
+	}
+	if _, err := recoveryWriter.Write(blockedPayload); err != nil {
+		_ = recoveryWriter.Close()
+		return err
+	}
+	if err := recoveryWriter.Close(); err != nil {
+		return err
+	}
+
+	completed := make([]job, 0, len(records))
+	for _, record := range records {
+		value, terminalErr := waitTerminal(restarted, record.id, 15*time.Second)
+		if terminalErr != nil {
+			return fmt.Errorf("recover accepted request %s: %w", record.requestID, terminalErr)
+		}
+		if value.Status != "succeeded" || value.ID != record.id || value.Spec != record.spec ||
+			value.Attempts != record.expectedAttempts || value.ArtifactSHA != record.artifactSHA || value.ArtifactSize != int64(len(record.artifact)) {
+			return fmt.Errorf("recovered completion mismatch: record=%+v job=%+v", record, value)
+		}
+		observed, readErr := os.ReadFile(record.spec.Destination)
+		if readErr != nil || !bytes.Equal(observed, record.artifact) {
+			return fmt.Errorf("recovered artifact mismatch for %s: bytes=%d err=%v", record.requestID, len(observed), readErr)
+		}
+		listed, listErr := restarted.listByRequest(record.requestID)
+		if listErr != nil || len(listed) != 1 || listed[0].ID != record.id || !sameDurableJob(listed[0], value) {
+			return fmt.Errorf("recovered idempotency mapping changed for %s: jobs=%+v err=%v", record.requestID, listed, listErr)
+		}
+		duplicateStatus, duplicate, duplicateRaw, duplicateErr := restarted.submit(record.spec)
+		if duplicateErr != nil || duplicateStatus != http.StatusOK || !duplicate.Existing || !sameDurableJob(duplicate.Job, value) {
+			return fmt.Errorf("recovered duplicate %s status=%d result=%+v err=%v body=%s", record.requestID, duplicateStatus, duplicate, duplicateErr, strings.TrimSpace(string(duplicateRaw)))
+		}
+		completed = append(completed, value)
+	}
+	receiptPath := filepath.Join(cfg.StateDir, "receipts.jsonl")
+	if err := assertExactReceipts(receiptPath, completed); err != nil {
+		return fmt.Errorf("compaction-crash receipts: %w", err)
+	}
+	receipts, err := readReceipts(receiptPath)
+	if err != nil {
+		return err
+	}
+	if len(receipts) != len(records) {
+		return fmt.Errorf("compaction-crash receipt count=%d expected=%d", len(receipts), len(records))
 	}
 	if err := restarted.stop(); err != nil {
 		return err

@@ -25,6 +25,9 @@ func New() *Publisher {
 }
 
 func (p *Publisher) Publish(ctx context.Context, manifestPath, destination string) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	manifest, manifestDir, err := LoadManifest(manifestPath)
 	if err != nil {
 		return Result{}, err
@@ -73,6 +76,9 @@ func (p *Publisher) Publish(ctx context.Context, manifestPath, destination strin
 		}
 		written += count
 	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	observedArtifact := hex.EncodeToString(artifactHash.Sum(nil))
 	if written != manifest.ArtifactSize {
 		return Result{}, fmt.Errorf("artifact size %d, expected %d", written, manifest.ArtifactSize)
@@ -83,10 +89,16 @@ func (p *Publisher) Publish(ctx context.Context, manifestPath, destination strin
 	if err := output.Sync(); err != nil {
 		return Result{}, fmt.Errorf("sync destination: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	if err := output.Close(); err != nil {
 		return Result{}, fmt.Errorf("close publication temporary: %w", err)
 	}
 	closed = true
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	if err := os.Rename(temporary, destination); err != nil {
 		return Result{}, fmt.Errorf("replace destination: %w", err)
 	}
