@@ -36,14 +36,16 @@ type verifier struct {
 }
 
 var (
-	activeCandidateUID uint32 = 200000
-	activeCandidateGID uint32 = 200000
+	activeCandidateUID uint32 = 60000
+	activeCandidateGID uint32 = 60000
 	managedPIDsMu      sync.Mutex
 	managedPIDs        = make(map[int]struct{})
 )
 
 func setCandidateIdentity(index int) {
-	activeCandidateUID = uint32(200000 + index)
+	// Stay within the 0..65535 range mapped by common rootless/user-namespace
+	// runtimes while retaining a distinct otherwise-unused identity per case.
+	activeCandidateUID = uint32(60000 + index)
 	activeCandidateGID = activeCandidateUID
 }
 

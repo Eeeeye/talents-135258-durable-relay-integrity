@@ -43,11 +43,12 @@ cd /app
 # candidate-controlled code.
 chown -R 0:0 /app "${work_dir}"
 chmod -R go-w /app "${work_dir}"
-# Harbor may already provide /tests as a read-only root-owned mount. Tighten
-# it before untrusted code runs. The verifier is already compiled, so candidate
-# tests and binaries never need to read this source tree.
-chown -R 0:0 /tests
-chmod -R u=rwX,go= /tests
+# Some remote Harbor backends expose /tests as a read-only root-owned mount.
+# The trusted verifier has already been compiled and runs before any candidate
+# test code, so tightening this source tree is defense in depth and must remain
+# best-effort on those backends.
+chown -R 0:0 /tests >/dev/null 2>&1 || true
+chmod -R u=rwX,go= /tests >/dev/null 2>&1 || true
 chmod 0711 "${work_dir}" "${bin_dir}"
 chmod 0500 "${work_dir}/verifier"
 chmod 0555 "${bin_dir}"/*
@@ -61,8 +62,8 @@ chmod 0555 "${bin_dir}"/*
 candidate_cache="${work_dir}/candidate-gocache"
 candidate_gopath="${work_dir}/candidate-gopath"
 candidate_tmp="${work_dir}/candidate-tmp"
-candidate_unit_uid=199999
-candidate_unit_gid=199999
+candidate_unit_uid=59999
+candidate_unit_gid=59999
 install -d -m 0700 -o "${candidate_unit_uid}" -g "${candidate_unit_gid}" \
     "${candidate_cache}" "${candidate_gopath}" "${candidate_tmp}"
 
