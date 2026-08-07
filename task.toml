@@ -7,7 +7,7 @@ authors = [{ name = "Talents task author" }]
 keywords = ["go", "durability", "wal", "concurrency", "idempotency", "atomic-files"]
 
 [metadata]
-difficulty = "hard"
+difficulty = "expert"
 difficulty_explanation = "L4: a human expert must establish one coherent acceptance and durability order across HTTP admission, Unicode-normalized idempotency, concurrent WAL sequencing, snapshot rotation, atomic filesystem publication, receipts, live reload, and crash recovery. An agent must diagnose interacting failures across these layers from black-box symptoms, preserve the public wire and DRW1 formats, reject tempting local fixes that introduce new crash windows, and validate nondeterministic concurrency and restart behavior without network access or new dependencies."
 category = "systems-engineering"
 tags = ["go", "durability", "wal", "concurrency", "idempotency", "atomic-files"]

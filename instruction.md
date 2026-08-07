@@ -155,18 +155,4 @@ Work inside `/app`. You may modify source, candidate-visible tests, and build
 files there. Do not alter `/tests` or verifier logs. The repaired relay must
 build and operate without Internet access or network-fetched dependencies; use
 the Go standard library and normal Linux filesystem/process facilities.
-
-At minimum, keep these commands passing:
-
-```bash
-cd /app
-go test ./...
-make build
-```
-
-Acceptance uses fresh binaries and independently generated randomized fixtures,
-temporary paths, and loopback ports. It observes HTTP results, process
-readiness/exit, exact artifact bytes, destination preservation, temporary-file
-hygiene, independent DRW1/CRC/sequence parsing, durable job identity, receipt
-counts, live worker behavior, concurrent compaction, and restart recovery.
-Candidate-generated logs or integrity summaries are not authoritative.
+Evaluation uses fresh binaries and independently generated randomized inputs.

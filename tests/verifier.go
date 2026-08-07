@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -63,6 +64,7 @@ func main() {
 		{"public-cli-compatibility", testPublicCLICompatibility},
 		{"ordinary-and-atomic-publication", testOrdinaryAndAtomicPublication},
 		{"strict-http-contract", testStrictHTTPContract},
+		{"manifest-validation-and-containment", testManifestValidationAndContainment},
 		{"durable-idempotency", testDurableIdempotency},
 		{"queue-admission-ownership", testQueueAdmissionOwnership},
 		{"success-receipt-crash-recovery", testSuccessReceiptCrashRecovery},
@@ -592,6 +594,272 @@ func expectHTTPError(label string, status int, raw []byte, expectedStatus int, e
 	decodeErr := json.Unmarshal(raw, &envelope)
 	if status != expectedStatus || decodeErr != nil || envelope.Error.Code != expectedCode || envelope.Error.Message == "" {
 		return fmt.Errorf("%s status=%d code=%q decode=%v body=%s", label, status, envelope.Error.Code, decodeErr, strings.TrimSpace(string(raw)))
+	}
+	return nil
+}
+
+func testManifestValidationAndContainment(v *verifier) error {
+	directory := filepath.Join(v.root, "manifest validation")
+	if err := prepareTestDirectory(directory); err != nil {
+		return err
+	}
+	cfg := baseConfig()
+	cfg.WorkerCount = 2
+	cfg.MaxAttempts = 1
+	cfg.RetryBaseMS = 5
+	configPath, cfg, err := v.prepareConfig(directory, cfg)
+	if err != nil {
+		return err
+	}
+	svc, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs"))
+	if err != nil {
+		return err
+	}
+	defer svc.kill()
+
+	cases := []struct {
+		name string
+		kind string
+	}{
+		{"wrong version", "wrong-version"},
+		{"unknown field", "unknown-field"},
+		{"trailing data", "trailing-data"},
+		{"multiple JSON values", "multiple-values"},
+		{"absolute chunk path", "absolute-path"},
+		{"parent traversal", "parent-traversal"},
+		{"non-canonical chunk path", "non-canonical-path"},
+		{"duplicate chunk path", "duplicate-path"},
+		{"empty chunk path", "empty-path"},
+		{"empty chunk list", "empty-chunks"},
+		{"too many chunks", "too-many-chunks"},
+		{"negative artifact size", "negative-artifact-size"},
+		{"negative chunk size", "negative-chunk-size"},
+		{"chunk size total overflow", "size-overflow"},
+		{"chunk size total mismatch", "size-mismatch"},
+		{"invalid artifact digest", "invalid-artifact-digest"},
+		{"uppercase artifact digest", "uppercase-artifact-digest"},
+		{"invalid chunk digest", "invalid-chunk-digest"},
+		{"uppercase chunk digest", "uppercase-chunk-digest"},
+		{"missing chunk", "missing-chunk"},
+		{"chunk content mismatch", "chunk-content-mismatch"},
+		{"artifact digest mismatch", "artifact-digest-mismatch"},
+		{"oversized manifest", "oversized-manifest"},
+	}
+
+	payload := v.bytes(v.intBetween(41, 113))
+	payloadDigest := fmt.Sprintf("%x", sha256.Sum256(payload))
+	emptyDigest := fmt.Sprintf("%x", sha256.Sum256(nil))
+	receiptPath := filepath.Join(cfg.StateDir, "receipts.jsonl")
+	for index, item := range cases {
+		generated, err := v.makeFixture(
+			directory,
+			fmt.Sprintf("case %02d %s", index, item.name),
+			[][]byte{payload, payload},
+		)
+		if err != nil {
+			return fmt.Errorf("%s fixture: %w", item.name, err)
+		}
+		firstRelative, err := filepath.Rel(generated.Dir, generated.ChunkPaths[0])
+		if err != nil {
+			return err
+		}
+		secondRelative, err := filepath.Rel(generated.Dir, generated.ChunkPaths[1])
+		if err != nil {
+			return err
+		}
+		manifest := manifestFile{
+			Version:        1,
+			ArtifactSize:   generated.ArtifactSize,
+			ArtifactSHA256: generated.ArtifactSHA,
+			Chunks: []manifestChunk{
+				{Path: firstRelative, Size: int64(len(payload)), SHA256: payloadDigest},
+				{Path: secondRelative, Size: int64(len(payload)), SHA256: payloadDigest},
+			},
+		}
+		var rawManifest []byte
+		var containmentPath string
+		var containmentBytes []byte
+
+		switch item.kind {
+		case "wrong-version":
+			manifest.Version = 2
+		case "unknown-field":
+			base, marshalErr := json.Marshal(manifest)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			rawManifest = append(rawManifest, base[:len(base)-1]...)
+			rawManifest = append(rawManifest, []byte(`,"unknown":true}`)...)
+		case "trailing-data":
+			base, marshalErr := json.Marshal(manifest)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			rawManifest = append(base, []byte(" trailing")...)
+		case "multiple-values":
+			base, marshalErr := json.Marshal(manifest)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			rawManifest = append(base, []byte("\n{}\n")...)
+		case "absolute-path":
+			manifest.Chunks[0].Path = string(filepath.Separator) + firstRelative
+		case "parent-traversal":
+			containmentPath = filepath.Join(directory, fmt.Sprintf("outside traversal %02d.bin", index))
+			containmentBytes = append([]byte(nil), payload...)
+			if err := writeCandidateReadableFile(containmentPath, containmentBytes); err != nil {
+				return err
+			}
+			manifest.Chunks[0].Path = filepath.Join("..", filepath.Base(containmentPath))
+		case "non-canonical-path":
+			nested := filepath.Join(generated.Dir, "chunks with spaces", "nested")
+			if err := prepareCandidateReadableDirectory(nested); err != nil {
+				return err
+			}
+			manifest.Chunks[0].Path = strings.Join(
+				[]string{"chunks with spaces", "nested", "..", filepath.Base(generated.ChunkPaths[0])},
+				string(filepath.Separator),
+			)
+		case "duplicate-path":
+			manifest.Chunks[1].Path = manifest.Chunks[0].Path
+		case "empty-path":
+			manifest.Chunks[0].Path = ""
+		case "empty-chunks":
+			manifest.ArtifactSize = 0
+			manifest.ArtifactSHA256 = emptyDigest
+			manifest.Chunks = []manifestChunk{}
+		case "too-many-chunks":
+			manyDirectory := filepath.Join(generated.Dir, "many empty chunks")
+			if err := prepareCandidateReadableDirectory(manyDirectory); err != nil {
+				return err
+			}
+			manifest.ArtifactSize = 0
+			manifest.ArtifactSHA256 = emptyDigest
+			manifest.Chunks = make([]manifestChunk, 0, 4097)
+			for chunkIndex := 0; chunkIndex < 4097; chunkIndex++ {
+				name := filepath.Join("many empty chunks", fmt.Sprintf("part-%04d.bin", chunkIndex))
+				if err := writeCandidateReadableFile(filepath.Join(generated.Dir, name), nil); err != nil {
+					return fmt.Errorf("create maximum-count probe %d: %w", chunkIndex, err)
+				}
+				manifest.Chunks = append(manifest.Chunks, manifestChunk{Path: name, SHA256: emptyDigest})
+			}
+		case "negative-artifact-size":
+			manifest.ArtifactSize = -1
+		case "negative-chunk-size":
+			manifest.Chunks[0].Size = -1
+		case "size-overflow":
+			manifest.Chunks[0].Size = int64(^uint64(0) >> 1)
+			manifest.Chunks[1].Size = 1
+			manifest.ArtifactSize = 0
+		case "size-mismatch":
+			manifest.ArtifactSize++
+		case "invalid-artifact-digest":
+			manifest.ArtifactSHA256 = strings.Repeat("g", 64)
+		case "uppercase-artifact-digest":
+			manifest.ArtifactSHA256 = "A" + manifest.ArtifactSHA256[1:]
+		case "invalid-chunk-digest":
+			manifest.Chunks[0].SHA256 = strings.Repeat("g", 64)
+		case "uppercase-chunk-digest":
+			manifest.Chunks[0].SHA256 = "A" + manifest.Chunks[0].SHA256[1:]
+		case "missing-chunk":
+			if err := os.Remove(generated.ChunkPaths[1]); err != nil {
+				return err
+			}
+		case "chunk-content-mismatch":
+			corrupt := append([]byte(nil), payload...)
+			corrupt[len(corrupt)/2] ^= 0x80
+			if err := writeCandidateReadableFile(generated.ChunkPaths[1], corrupt); err != nil {
+				return err
+			}
+		case "artifact-digest-mismatch":
+			if manifest.ArtifactSHA256[0] == '0' {
+				manifest.ArtifactSHA256 = "1" + manifest.ArtifactSHA256[1:]
+			} else {
+				manifest.ArtifactSHA256 = "0" + manifest.ArtifactSHA256[1:]
+			}
+		case "oversized-manifest":
+			base, marshalErr := json.Marshal(manifest)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			rawManifest = append(base, bytes.Repeat([]byte(" "), (8<<20)+1-len(base))...)
+		default:
+			return fmt.Errorf("unknown manifest case kind %q", item.kind)
+		}
+
+		if rawManifest == nil {
+			rawManifest, err = json.Marshal(manifest)
+			if err != nil {
+				return err
+			}
+		}
+		if err := writeCandidateReadableFile(generated.Manifest, rawManifest); err != nil {
+			return fmt.Errorf("%s manifest: %w", item.name, err)
+		}
+
+		destinationDirectory := filepath.Join(directory, fmt.Sprintf("destination %02d", index))
+		if err := prepareCandidateWritableDirectory(destinationDirectory); err != nil {
+			return err
+		}
+		destination := filepath.Join(destinationDirectory, "preserve.bin")
+		destinationSentinel := append([]byte("pre-existing:"+item.name+":"), v.bytes(73)...)
+		if err := os.WriteFile(destination, destinationSentinel, 0o640); err != nil {
+			return err
+		}
+		beforeReceipts, err := readReceipts(receiptPath)
+		if err != nil {
+			return err
+		}
+
+		requestID := v.token("invalid-manifest")
+		status, submitted, raw, err := svc.submit(jobSpec{
+			RequestID: requestID, Manifest: generated.Manifest,
+			Destination: destination, MaxAttempts: 1,
+		})
+		if err != nil || status != http.StatusAccepted || submitted.Existing || submitted.Job.ID == "" {
+			return fmt.Errorf("%s submit status=%d result=%+v err=%v body=%s", item.name, status, submitted, err, strings.TrimSpace(string(raw)))
+		}
+		failed, err := waitTerminal(svc, submitted.Job.ID, 12*time.Second)
+		if err != nil {
+			return fmt.Errorf("%s terminal state: %w", item.name, err)
+		}
+		if failed.Status != "failed" || failed.Attempts != 1 {
+			return fmt.Errorf("%s invalid manifest reached unexpected terminal state: %+v", item.name, failed)
+		}
+		preserved, err := os.ReadFile(destination)
+		if err != nil || !bytes.Equal(preserved, destinationSentinel) {
+			return fmt.Errorf("%s changed pre-existing destination: bytes=%d err=%v", item.name, len(preserved), err)
+		}
+		entries, err := directoryNames(destinationDirectory)
+		if err != nil || len(entries) != 1 || entries[0] != filepath.Base(destination) {
+			return fmt.Errorf("%s left publication residue: entries=%v err=%v", item.name, entries, err)
+		}
+		manifestAfter, err := os.ReadFile(generated.Manifest)
+		if err != nil || !bytes.Equal(manifestAfter, rawManifest) {
+			return fmt.Errorf("%s changed verifier manifest: bytes=%d err=%v", item.name, len(manifestAfter), err)
+		}
+		if containmentPath != "" {
+			observed, readErr := os.ReadFile(containmentPath)
+			if readErr != nil || !bytes.Equal(observed, containmentBytes) {
+				return fmt.Errorf("%s changed traversal sentinel: bytes=%d err=%v", item.name, len(observed), readErr)
+			}
+		}
+		afterReceipts, err := readReceipts(receiptPath)
+		if err != nil {
+			return err
+		}
+		if len(afterReceipts) != len(beforeReceipts) {
+			return fmt.Errorf("%s wrote a receipt for failed work: before=%d after=%d", item.name, len(beforeReceipts), len(afterReceipts))
+		}
+		for _, observed := range afterReceipts {
+			if observed.JobID == submitted.Job.ID || observed.RequestID == requestID {
+				return fmt.Errorf("%s wrote a receipt for failed job: %+v", item.name, observed)
+			}
+		}
+	}
+
+	if err := svc.stop(); err != nil {
+		return err
 	}
 	return nil
 }
