@@ -1712,36 +1712,47 @@ func testPeriodicSnapshotAndListenerPolicy(v *verifier) error {
 	go func() {
 		result := periodicObservation{}
 		var previous uint64
-		for {
-			select {
-			case <-observerStop:
-				observerResult <- result
-				return
-			default:
-			}
+		observe := func() bool {
 			observed, exists, readErr := readSnapshot(snapshotPath)
 			result.reads++
 			if readErr != nil {
 				result.err = fmt.Errorf("automatic snapshot was partially visible: %w", readErr)
-				observerResult <- result
-				return
+				return false
 			}
 			if result.seen && !exists {
 				result.err = errors.New("automatic snapshot disappeared after becoming visible")
-				observerResult <- result
-				return
+				return false
 			}
 			if exists {
 				result.seen = true
 				if observed.LastSequence < previous {
 					result.err = fmt.Errorf("automatic snapshot sequence regressed %d -> %d", previous, observed.LastSequence)
-					observerResult <- result
-					return
+					return false
 				}
 				previous = observed.LastSequence
 				if observed.LastSequence > result.maxSequence {
 					result.maxSequence = observed.LastSequence
 				}
+			}
+			return true
+		}
+		for {
+			select {
+			case <-observerStop:
+				// The main goroutine closes observerStop immediately after it
+				// observes the target snapshot. Take one final independent read
+				// before reporting so a scheduler handoff cannot leave this
+				// observer one valid snapshot generation behind.
+				if result.err == nil {
+					_ = observe()
+				}
+				observerResult <- result
+				return
+			default:
+			}
+			if !observe() {
+				observerResult <- result
+				return
 			}
 			time.Sleep(time.Millisecond)
 		}
