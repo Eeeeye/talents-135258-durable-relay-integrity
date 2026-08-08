@@ -62,8 +62,15 @@ chmod 0555 "${bin_dir}"/*
 # Run the trusted integration phase first. Candidate tests are arbitrary code;
 # placing them last prevents a detached test process from observing or racing
 # verifier-created services, fixtures, state, or timing windows.
+set +e
 "${work_dir}/verifier" -bin-dir "${bin_dir}" \
     > /logs/verifier/integration.log 2>&1
+integration_status=$?
+set -e
+cat /logs/verifier/integration.log
+if (( integration_status != 0 )); then
+    exit "${integration_status}"
+fi
 
 candidate_cache="${work_dir}/candidate-gocache"
 candidate_gopath="${work_dir}/candidate-gopath"
@@ -89,6 +96,5 @@ if (( unit_status != 0 )); then
     exit "${unit_status}"
 fi
 
-cat /logs/verifier/integration.log
 cat /logs/verifier/unit-tests.log
 reward=1
