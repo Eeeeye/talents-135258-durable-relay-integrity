@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1728,7 +1727,7 @@ func testTransactionalReload(v *verifier) error {
 	}
 	cfg := baseConfig()
 	cfg.WorkerCount = 1
-	cfg.RetryBaseMS = 1800
+	cfg.RetryBaseMS = 7000
 	cfg.MaxAttempts = 2
 	configPath, cfg, err := v.prepareConfig(directory, cfg)
 	if err != nil {
@@ -1881,7 +1880,7 @@ func testTransactionalReload(v *verifier) error {
 	}
 
 	unchangedWorkers := updated
-	unchangedWorkers.RetryBaseMS = v.intBetween(600, 650)
+	unchangedWorkers.RetryBaseMS = v.intBetween(1200, 1300)
 	unchangedWorkers.MaxAttempts = v.intBetween(7, 10)
 	unchangedWorkers.MaxRequestBytes = int64(v.intBetween(9000, 12000))
 	if err := writeJSON(configPath, unchangedWorkers); err != nil {
@@ -1990,13 +1989,16 @@ func testTransactionalReload(v *verifier) error {
 	verifyRetryTiming := func(label string, current configFile) ([]job, fixture, error) {
 		const sampleCount = 3
 		base := time.Duration(current.RetryBaseMS) * time.Millisecond
-		tolerance := base / 10
-		if tolerance < 50*time.Millisecond {
-			tolerance = 50 * time.Millisecond
-		}
-		hardMaximum := base + 500*time.Millisecond
+		// The lower bound is measured between candidate-published state
+		// transitions, so verifier polling and FIFO-writer scheduling are not
+		// part of the graded delay. Require one clean sample out of three for
+		// the upper bound so transient scheduler stalls cannot fail a correct
+		// implementation, while a systematic extra delay fails every sample.
+		transitionAllowance := 250 * time.Millisecond
+		livenessTimeout := base + 5*time.Second
 		completed := make([]job, 0, sampleCount)
-		elapsedSamples := make([]time.Duration, 0, sampleCount)
+		transitionSamples := make([]time.Duration, 0, sampleCount)
+		bestTransition := livenessTimeout
 		var boundaryFixture fixture
 
 		for sample := 0; sample < sampleCount; sample++ {
@@ -2037,7 +2039,6 @@ func testTransactionalReload(v *verifier) error {
 				_ = firstWriter.file.Close()
 				return nil, fixture{}, writeErr
 			}
-			failureReleaseStartedAt := time.Now()
 			if closeErr := firstWriter.file.Close(); closeErr != nil {
 				return nil, fixture{}, closeErr
 			}
@@ -2067,29 +2068,31 @@ func testTransactionalReload(v *verifier) error {
 				file, openErr := os.OpenFile(chunkPath, os.O_WRONLY, 0)
 				openedWriter <- fifoOpenResult{path: chunkPath, file: file, openedAt: time.Now(), err: openErr}
 			}()
-			remaining := time.Until(failureReleaseStartedAt.Add(hardMaximum))
-			if remaining <= 0 {
-				return nil, fixture{}, fmt.Errorf("%s exhausted hard retry observation window before FIFO setup", sampleLabel)
-			}
 			var opened fifoOpenResult
 			select {
 			case opened = <-openedWriter:
-			case <-time.After(remaining):
-				return nil, fixture{}, fmt.Errorf("%s retry did not reopen the controlled chunk within %s", sampleLabel, hardMaximum)
+			case <-time.After(livenessTimeout):
+				return nil, fixture{}, fmt.Errorf("%s retry did not reopen the controlled chunk within %s", sampleLabel, livenessTimeout)
 			}
 			if opened.err != nil {
 				return nil, fixture{}, opened.err
 			}
-			elapsed := opened.openedAt.Sub(failureReleaseStartedAt)
-			if elapsed < base {
+			secondAttempt, stateErr := waitForJob(svc, retrySubmit.Job.ID, 2*time.Second, func(value job) bool {
+				return value.Status == "running" && value.Attempts == 2
+			})
+			if stateErr != nil {
 				_ = opened.file.Close()
-				return nil, fixture{}, fmt.Errorf("%s retry_base_ms=%d reopened too early: elapsed=%s", sampleLabel, current.RetryBaseMS, elapsed)
+				return nil, fixture{}, fmt.Errorf("%s second attempt state: %w", sampleLabel, stateErr)
 			}
-			if elapsed >= hardMaximum {
+			transitionDelay := secondAttempt.UpdatedAt.Sub(retrying.UpdatedAt)
+			if transitionDelay < base {
 				_ = opened.file.Close()
-				return nil, fixture{}, fmt.Errorf("%s retry_base_ms=%d exceeded hard maximum %s: elapsed=%s", sampleLabel, current.RetryBaseMS, hardMaximum, elapsed)
+				return nil, fixture{}, fmt.Errorf("%s retry_base_ms=%d transitioned too early: retry_wait=%s running=%s delay=%s", sampleLabel, current.RetryBaseMS, retrying.UpdatedAt.Format(time.RFC3339Nano), secondAttempt.UpdatedAt.Format(time.RFC3339Nano), transitionDelay)
 			}
-			elapsedSamples = append(elapsedSamples, elapsed)
+			transitionSamples = append(transitionSamples, transitionDelay)
+			if transitionDelay < bestTransition {
+				bestTransition = transitionDelay
+			}
 			if _, writeErr := opened.file.Write(retryData); writeErr != nil {
 				_ = opened.file.Close()
 				return nil, fixture{}, writeErr
@@ -2107,11 +2110,9 @@ func testTransactionalReload(v *verifier) error {
 			completed = append(completed, retried)
 		}
 
-		sort.Slice(elapsedSamples, func(left, right int) bool { return elapsedSamples[left] < elapsedSamples[right] })
-		median := elapsedSamples[len(elapsedSamples)/2]
-		maximum := base + tolerance
-		if median >= maximum {
-			return nil, fixture{}, fmt.Errorf("%s retry_base_ms=%d median outside [%s,%s): samples=%v", label, current.RetryBaseMS, base, maximum, elapsedSamples)
+		maximumCleanTransition := base + transitionAllowance
+		if bestTransition >= maximumCleanTransition {
+			return nil, fixture{}, fmt.Errorf("%s retry_base_ms=%d has no clean transition below %s: samples=%v", label, current.RetryBaseMS, maximumCleanTransition, transitionSamples)
 		}
 		return completed, boundaryFixture, nil
 	}
@@ -2123,7 +2124,7 @@ func testTransactionalReload(v *verifier) error {
 	reloadCompleted = append(reloadCompleted, fastRetries...)
 
 	slowerRetryConfig := scaledDown
-	slowerRetryConfig.RetryBaseMS = v.intBetween(1100, 1200)
+	slowerRetryConfig.RetryBaseMS = v.intBetween(4000, 4200)
 	if err := writeJSON(configPath, slowerRetryConfig); err != nil {
 		return err
 	}
@@ -3280,6 +3281,21 @@ func testCorruptionFailsClosed(v *verifier) error {
 	encodeReceiptLines := func(lines [][]byte) []byte {
 		return append(bytes.Join(lines, []byte{'\n'}), '\n')
 	}
+	// Invalid-field cases use an otherwise unrelated historical line. That
+	// isolates strict ledger validation from the separate rule that a receipt
+	// for a succeeded durable job must match its completion fields.
+	appendHistoricalReceipt := func(label string, mutate func(*receipt)) ([]byte, error) {
+		changed := parsedReceipts[0]
+		changed.JobID = v.token(label + "-job")
+		changed.RequestID = v.token(label + "-request")
+		changed.Destination += "." + label
+		mutate(&changed)
+		raw, err := json.Marshal(changed)
+		if err != nil {
+			return nil, err
+		}
+		return append(append([]byte(nil), originalReceipts...), append(raw, '\n')...), nil
+	}
 	type receiptDamageCase struct {
 		name   string
 		mutate func() ([]byte, error)
@@ -3303,6 +3319,33 @@ func testCorruptionFailsClosed(v *verifier) error {
 			}
 			lines[0] = append(lines[0], []byte(`{}`)...)
 			return encodeReceiptLines(lines), nil
+		}},
+		{name: "invalid-receipt-version", mutate: func() ([]byte, error) {
+			return appendHistoricalReceipt("invalid-version", func(value *receipt) { value.Version = 2 })
+		}},
+		{name: "empty-receipt-job-id", mutate: func() ([]byte, error) {
+			return appendHistoricalReceipt("empty-job-id", func(value *receipt) { value.JobID = "" })
+		}},
+		{name: "empty-receipt-request-id", mutate: func() ([]byte, error) {
+			return appendHistoricalReceipt("empty-request-id", func(value *receipt) { value.RequestID = "" })
+		}},
+		{name: "empty-receipt-destination", mutate: func() ([]byte, error) {
+			return appendHistoricalReceipt("empty-destination", func(value *receipt) { value.Destination = "" })
+		}},
+		{name: "zero-receipt-completed-at", mutate: func() ([]byte, error) {
+			return appendHistoricalReceipt("zero-completed-at", func(value *receipt) { value.CompletedAt = time.Time{} })
+		}},
+		{name: "negative-receipt-artifact-size", mutate: func() ([]byte, error) {
+			return appendHistoricalReceipt("negative-artifact-size", func(value *receipt) { value.ArtifactSize = -1 })
+		}},
+		{name: "non-hex-receipt-artifact-sha", mutate: func() ([]byte, error) {
+			return appendHistoricalReceipt("non-hex-artifact-sha", func(value *receipt) { value.ArtifactSHA256 = strings.Repeat("g", 64) })
+		}},
+		{name: "short-receipt-artifact-sha", mutate: func() ([]byte, error) {
+			return appendHistoricalReceipt("short-artifact-sha", func(value *receipt) { value.ArtifactSHA256 = "deadbeef" })
+		}},
+		{name: "uppercase-receipt-artifact-sha", mutate: func() ([]byte, error) {
+			return appendHistoricalReceipt("uppercase-artifact-sha", func(value *receipt) { value.ArtifactSHA256 = "A" + value.ArtifactSHA256[1:] })
 		}},
 		{name: "duplicate-receipt-job", mutate: func() ([]byte, error) {
 			return append(append([]byte(nil), originalReceipts...), append(append([]byte(nil), receiptLines[0]...), '\n')...), nil

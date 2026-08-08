@@ -895,8 +895,17 @@ func readReceipts(path string) ([]receipt, error) {
 		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("receipt line %d has trailing JSON", line)
 		}
-		if value.Version != 1 || value.JobID == "" || value.RequestID == "" || value.CompletedAt.IsZero() {
+		if value.Version != 1 || value.JobID == "" || value.RequestID == "" || value.Destination == "" || value.CompletedAt.IsZero() {
 			return nil, fmt.Errorf("receipt line %d has invalid required fields", line)
+		}
+		if value.ArtifactSize < 0 {
+			return nil, fmt.Errorf("receipt line %d has negative artifact_size", line)
+		}
+		if len(value.ArtifactSHA256) != 64 || value.ArtifactSHA256 != strings.ToLower(value.ArtifactSHA256) {
+			return nil, fmt.Errorf("receipt line %d has invalid artifact_sha256", line)
+		}
+		if _, err := hex.DecodeString(value.ArtifactSHA256); err != nil {
+			return nil, fmt.Errorf("receipt line %d has invalid artifact_sha256: %w", line, err)
 		}
 		result = append(result, value)
 	}
