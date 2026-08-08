@@ -111,6 +111,14 @@ restart. A successfully completed logical job must have exactly one valid
 version-1 line in `receipts.jsonl`, including across concurrent duplicates,
 retries, and restart recovery.
 
+`receipts.jsonl` is strict append-only JSONL. At startup, malformed, truncated,
+unknown-field, trailing-JSON, invalid version-1, or duplicate job/request
+receipt lines must make startup fail closed without rewriting the ledger. For
+every job that `snapshot.json` plus `events.wal` says is succeeded, an existing
+receipt must match all durable completion fields exactly; a missing receipt is
+reconciled once. Other syntactically valid historical receipt lines are
+retained but are not an alternate source of job state.
+
 For this contract, normalized `manifest` and `destination` mean exactly the
 strings produced by the existing `JobSpec` validation: trim leading and
 trailing Unicode whitespace and perform no `filepath.Clean`, absolutization,
@@ -128,9 +136,13 @@ publication failure does not release its `request_id`, and a duplicate cannot
 replace that job's inputs.
 
 Termination at any point after artifact publication, including between the
-durable success and receipt writes, must recover without reclassifying the job
-as failed or producing a second receipt. After restart the job must converge to
-`succeeded` with exactly one receipt containing its durable completion values.
+durable success and receipt writes, must recover without producing a second
+receipt. Until a durable `job_succeeded` transition exists, recovery may treat
+the attempt as nonterminal and repeat the idempotent publication; submitted
+manifests and chunks are assumed to remain readable until the job becomes
+terminal. Once durable success exists, recovery must not publish again. In both
+cases the job must converge to `succeeded` with exactly one matching receipt.
+No additional event type or schema field is required or permitted.
 
 ## 6. Preserve the public contract
 

@@ -3,11 +3,13 @@ package ledger
 import (
 	"bufio"
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 
 	"example.com/durable-relay/internal/model"
@@ -17,7 +19,8 @@ type Ledger struct {
 	path string
 	file *os.File
 	mu   sync.Mutex
-	seen map[string]model.Receipt
+	jobs map[string]model.Receipt
+	keys map[string]model.Receipt
 }
 
 func Open(path string) (*Ledger, error) {
@@ -25,18 +28,23 @@ func Open(path string) (*Ledger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("scan receipt ledger: %w", err)
 	}
-	seen := make(map[string]model.Receipt, len(existing))
+	jobs := make(map[string]model.Receipt, len(existing))
+	keys := make(map[string]model.Receipt, len(existing))
 	for _, receipt := range existing {
-		if previous, ok := seen[receipt.JobID]; ok {
+		if previous, ok := jobs[receipt.JobID]; ok {
 			return nil, fmt.Errorf("duplicate receipts for job %q and request_id %q", previous.JobID, receipt.RequestID)
 		}
-		seen[receipt.JobID] = receipt
+		if previous, ok := keys[receipt.RequestID]; ok {
+			return nil, fmt.Errorf("duplicate receipts for request_id %q and jobs %q/%q", receipt.RequestID, previous.JobID, receipt.JobID)
+		}
+		jobs[receipt.JobID] = receipt
+		keys[receipt.RequestID] = receipt
 	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open receipt ledger: %w", err)
 	}
-	return &Ledger{path: path, file: file, seen: seen}, nil
+	return &Ledger{path: path, file: file, jobs: jobs, keys: keys}, nil
 }
 
 func (l *Ledger) Path() string {
@@ -54,11 +62,14 @@ func (l *Ledger) Append(receipt model.Receipt) error {
 	if l.file == nil {
 		return errors.New("receipt ledger is closed")
 	}
-	if previous, ok := l.seen[receipt.JobID]; ok {
+	if previous, ok := l.jobs[receipt.JobID]; ok {
 		if sameReceipt(previous, receipt) {
 			return nil
 		}
 		return fmt.Errorf("receipt conflict for job %q and request_id %q", receipt.JobID, receipt.RequestID)
+	}
+	if previous, ok := l.keys[receipt.RequestID]; ok {
+		return fmt.Errorf("receipt conflict for request_id %q and jobs %q/%q", receipt.RequestID, previous.JobID, receipt.JobID)
 	}
 	if _, err := l.file.Write(raw); err != nil {
 		return fmt.Errorf("append receipt: %w", err)
@@ -66,7 +77,8 @@ func (l *Ledger) Append(receipt model.Receipt) error {
 	if err := l.file.Sync(); err != nil {
 		return fmt.Errorf("sync receipt: %w", err)
 	}
-	l.seen[receipt.JobID] = receipt
+	l.jobs[receipt.JobID] = receipt
+	l.keys[receipt.RequestID] = receipt
 	return nil
 }
 
@@ -121,8 +133,8 @@ func Scan(path string) ([]model.Receipt, error) {
 		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("receipt line %d has trailing JSON", line)
 		}
-		if receipt.Version != 1 || receipt.JobID == "" || receipt.RequestID == "" {
-			return nil, fmt.Errorf("receipt line %d has invalid required fields", line)
+		if err := validateReceipt(receipt); err != nil {
+			return nil, fmt.Errorf("receipt line %d: %w", line, err)
 		}
 		receipts = append(receipts, receipt)
 	}
@@ -130,4 +142,20 @@ func Scan(path string) ([]model.Receipt, error) {
 		return nil, err
 	}
 	return receipts, nil
+}
+
+func validateReceipt(receipt model.Receipt) error {
+	if receipt.Version != 1 || receipt.JobID == "" || receipt.RequestID == "" || receipt.Destination == "" || receipt.CompletedAt.IsZero() {
+		return errors.New("invalid required fields")
+	}
+	if receipt.ArtifactSize < 0 {
+		return errors.New("negative artifact_size")
+	}
+	if len(receipt.ArtifactSHA256) != 64 || strings.ToLower(receipt.ArtifactSHA256) != receipt.ArtifactSHA256 {
+		return errors.New("artifact_sha256 must be 64 lowercase hex characters")
+	}
+	if _, err := hex.DecodeString(receipt.ArtifactSHA256); err != nil {
+		return fmt.Errorf("invalid artifact_sha256: %w", err)
+	}
+	return nil
 }

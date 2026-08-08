@@ -9,6 +9,7 @@ keywords = ["go", "durability", "wal", "concurrency", "idempotency", "atomic-fil
 [metadata]
 difficulty = "expert"
 difficulty_explanation = "L4: a human expert must establish one coherent acceptance and durability order across HTTP admission, Unicode-normalized idempotency, concurrent WAL sequencing, snapshot rotation, atomic filesystem publication, receipts, live reload, and crash recovery. An agent must diagnose interacting failures across these layers from black-box symptoms, preserve the public wire and DRW1 formats, reject tempting local fixes that introduce new crash windows, and validate nondeterministic concurrency and restart behavior without network access or new dependencies."
+solution_explanation = "The reference repair establishes a single recoverable order across admission, WAL publication, snapshot cutover, artifact replacement, success persistence, and receipt reconciliation. It atomically swaps live configuration, reserves queue capacity before claiming an idempotency key, serializes WAL sequence/state/snapshot operations, rejects damaged durable input, publishes through a validated same-directory temporary file, records durable success before an idempotent receipt, and reschedules only nonterminal jobs after restart."
 category = "systems-engineering"
 tags = ["go", "durability", "wal", "concurrency", "idempotency", "atomic-files"]
 activity_id = "135258"

@@ -18,10 +18,10 @@ func TestAppendAndScanReceipts(t *testing.T) {
 		receipt := model.Receipt{
 			Version:        1,
 			JobID:          "job-" + string(rune('a'+index)),
-			RequestID:      "request",
+			RequestID:      "request-" + string(rune('a'+index)),
 			Destination:    "archive.bin",
 			ArtifactSize:   int64(index),
-			ArtifactSHA256: "digest",
+			ArtifactSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			CompletedAt:    time.Now().UTC(),
 		}
 		if err := ledger.Append(receipt); err != nil {

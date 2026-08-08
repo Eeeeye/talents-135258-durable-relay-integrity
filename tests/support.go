@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -42,11 +43,37 @@ var (
 	managedPIDs        = make(map[int]struct{})
 )
 
-func setCandidateIdentity(index int) {
-	// Stay within the 0..65535 range mapped by common rootless/user-namespace
-	// runtimes while retaining a distinct otherwise-unused identity per case.
-	activeCandidateUID = uint32(60000 + index)
-	activeCandidateGID = activeCandidateUID
+func setCandidateIdentity(uid uint32) {
+	activeCandidateUID = uid
+	activeCandidateGID = uid
+}
+
+func secureRandomName() (string, error) {
+	var raw [16]byte
+	if _, err := cryptorand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func secureDirectory(parent string) (string, error) {
+	for attempt := 0; attempt < 32; attempt++ {
+		name, err := secureRandomName()
+		if err != nil {
+			return "", err
+		}
+		path := filepath.Join(parent, name)
+		if err := os.Mkdir(path, 0o700); err == nil {
+			return path, nil
+		} else if !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+	}
+	return "", errors.New("exhausted secure temporary-directory attempts")
+}
+
+func (v *verifier) caseDirectory() (string, error) {
+	return secureDirectory(v.root)
 }
 
 func candidateProcessAttributes() *syscall.SysProcAttr {

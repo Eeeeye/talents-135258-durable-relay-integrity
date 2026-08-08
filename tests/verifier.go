@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,7 +41,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "verifier: choose seed: %v\n", err)
 		os.Exit(2)
 	}
-	root, err := os.MkdirTemp("", "durable-relay-integration-")
+	root, err := secureDirectory(os.TempDir())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "verifier: temp root: %v\n", err)
 		os.Exit(2)
@@ -54,8 +55,6 @@ func main() {
 	} else {
 		fmt.Printf("verifier preserving temp root=%s\n", root)
 	}
-	v := &verifier{binDir: *binDir, root: root, seed: seed, rng: rand.New(rand.NewSource(seed))}
-
 	tests := []struct {
 		name string
 		run  func(*verifier) error
@@ -75,25 +74,59 @@ func main() {
 		{"corrupt-state-fails-closed", testCorruptionFailsClosed},
 	}
 
-	fmt.Printf("verifier seed=%d root=%s\n", seed, root)
-	for index, test := range tests {
-		setCandidateIdentity(index)
-		started := time.Now()
-		fmt.Printf("RUN  %s candidate_uid=%d\n", test.name, activeCandidateUID)
-		testErr := test.run(v)
-		cleanupErr := cleanupCandidateDescendants(activeCandidateUID)
-		if testErr != nil || cleanupErr != nil {
-			fmt.Printf("FAIL %s (%s): %v\n", test.name, time.Since(started).Round(time.Millisecond), errors.Join(testErr, cleanupErr))
-			fmt.Printf("reproduce with DURABLE_RELAY_TEST_SEED=%d\n", seed)
-			os.Exit(1)
+	usedIdentities := make(map[uint32]struct{}, len(tests)*2)
+	fmt.Printf("verifier seed=%d identity_passes=2\n", seed)
+	for pass := 1; pass <= 2; pass++ {
+		// Reset the semantic input stream so both randomized identity passes
+		// exercise the same cases while using fresh filesystem namespaces.
+		v := &verifier{binDir: *binDir, root: root, seed: seed, rng: rand.New(rand.NewSource(seed))}
+		for _, test := range tests {
+			uid, identityErr := randomCandidateIdentity(usedIdentities)
+			if identityErr != nil {
+				fmt.Fprintf(os.Stderr, "verifier: choose candidate identity: %v\n", identityErr)
+				os.Exit(2)
+			}
+			setCandidateIdentity(uid)
+			started := time.Now()
+			fmt.Printf("RUN  %s identity_pass=%d\n", test.name, pass)
+			testErr := test.run(v)
+			cleanupErr := cleanupCandidateDescendants(activeCandidateUID)
+			if testErr != nil || cleanupErr != nil {
+				fmt.Printf("FAIL %s identity_pass=%d (%s): %v\n", test.name, pass, time.Since(started).Round(time.Millisecond), errors.Join(testErr, cleanupErr))
+				fmt.Printf("reproduce semantic inputs with DURABLE_RELAY_TEST_SEED=%d\n", seed)
+				os.Exit(1)
+			}
+			fmt.Printf("PASS %s identity_pass=%d (%s)\n", test.name, pass, time.Since(started).Round(time.Millisecond))
 		}
-		fmt.Printf("PASS %s (%s)\n", test.name, time.Since(started).Round(time.Millisecond))
 	}
 	fmt.Printf("all integration checks passed; seed=%d\n", seed)
 }
 
+func randomCandidateIdentity(used map[uint32]struct{}) (uint32, error) {
+	// Keep identities inside the range mapped by common rootless runtimes, away
+	// from system accounts and the separately isolated candidate-unit UID.
+	const minimum uint32 = 20000
+	const span uint32 = 39000
+	for attempt := 0; attempt < 256; attempt++ {
+		var raw [4]byte
+		if _, err := cryptorand.Read(raw[:]); err != nil {
+			return 0, err
+		}
+		candidate := minimum + binary.LittleEndian.Uint32(raw[:])%span
+		if _, exists := used[candidate]; exists {
+			continue
+		}
+		used[candidate] = struct{}{}
+		return candidate, nil
+	}
+	return 0, errors.New("exhausted candidate identity selection")
+}
+
 func testCandidateProcessContainment(v *verifier) error {
-	directory := filepath.Join(v.root, "candidate process containment")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := prepareTestDirectory(directory); err != nil {
 		return err
 	}
@@ -115,7 +148,10 @@ func testCandidateProcessContainment(v *verifier) error {
 }
 
 func testPublicCLICompatibility(v *verifier) error {
-	directory := filepath.Join(v.root, "public CLI compatibility")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
@@ -289,7 +325,10 @@ func verifierSeed() (int64, error) {
 }
 
 func testOrdinaryAndAtomicPublication(v *verifier) error {
-	directory := filepath.Join(v.root, "ordinary atomic")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
@@ -565,7 +604,10 @@ func testOrdinaryAndAtomicPublication(v *verifier) error {
 }
 
 func testStrictHTTPContract(v *verifier) error {
-	directory := filepath.Join(v.root, "strict http")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
@@ -726,7 +768,10 @@ func expectHTTPError(label string, status int, raw []byte, expectedStatus int, e
 }
 
 func testManifestValidationAndContainment(v *verifier) error {
-	directory := filepath.Join(v.root, "manifest validation")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := prepareTestDirectory(directory); err != nil {
 		return err
 	}
@@ -992,7 +1037,10 @@ func testManifestValidationAndContainment(v *verifier) error {
 }
 
 func testDurableIdempotency(v *verifier) error {
-	directory := filepath.Join(v.root, "durable idempotency")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
@@ -1191,7 +1239,10 @@ func testDurableIdempotency(v *verifier) error {
 }
 
 func testQueueAdmissionOwnership(v *verifier) error {
-	directory := filepath.Join(v.root, "queue admission ownership")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
@@ -1399,7 +1450,10 @@ func testQueueAdmissionOwnership(v *verifier) error {
 }
 
 func testSuccessReceiptCrashRecovery(v *verifier) error {
-	directory := filepath.Join(v.root, "success receipt crash")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
@@ -1665,7 +1719,10 @@ func assertRejectedReload(svc *service, configPath, label string, candidate []by
 }
 
 func testTransactionalReload(v *verifier) error {
-	directory := filepath.Join(v.root, "transactional reload")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
@@ -1930,112 +1987,140 @@ func testTransactionalReload(v *verifier) error {
 		reloadCompleted = append(reloadCompleted, value)
 	}
 
-	verifyRetryTiming := func(label string, current configFile, upperSlack time.Duration) (job, fixture, error) {
-		retryData := v.bytes(7777)
-		retryFixture, chunkPath, fixtureErr := v.makeFIFOFixture(directory, label+" fixture", retryData)
-		if fixtureErr != nil {
-			return job{}, fixture{}, fixtureErr
-		}
-		retryStatus, retrySubmit, retryRaw, submitErr := svc.submit(jobSpec{
-			RequestID: v.token(label), Manifest: retryFixture.Manifest,
-			Destination: filepath.Join(directory, "retry archive", label+".bin"),
-		})
-		if submitErr != nil || retryStatus != http.StatusAccepted {
-			return job{}, fixture{}, fmt.Errorf("%s submit status=%d err=%v body=%s", label, retryStatus, submitErr, strings.TrimSpace(string(retryRaw)))
-		}
-		firstWriterResult := make(chan fifoOpenResult, 1)
-		go func() {
-			file, openErr := os.OpenFile(chunkPath, os.O_WRONLY, 0)
-			firstWriterResult <- fifoOpenResult{path: chunkPath, file: file, openedAt: time.Now(), err: openErr}
-		}()
-		var firstWriter fifoOpenResult
-		select {
-		case firstWriter = <-firstWriterResult:
-		case <-time.After(3 * time.Second):
-			return job{}, fixture{}, fmt.Errorf("%s first attempt did not open the controlled chunk", label)
-		}
-		if firstWriter.err != nil {
-			return job{}, fixture{}, firstWriter.err
-		}
-		corrupt := append([]byte(nil), retryData...)
-		corrupt[len(corrupt)/2] ^= 0x80
-		if _, writeErr := firstWriter.file.Write(corrupt); writeErr != nil {
-			_ = firstWriter.file.Close()
-			return job{}, fixture{}, writeErr
-		}
-		if closeErr := firstWriter.file.Close(); closeErr != nil {
-			return job{}, fixture{}, closeErr
-		}
-		failureReleasedAt := time.Now()
-		retrying, waitErr := waitForJob(svc, retrySubmit.Job.ID, 2*time.Second, func(value job) bool {
-			return value.Status == "retry_wait" && value.Attempts == 1
-		})
-		if waitErr != nil {
-			return job{}, fixture{}, waitErr
-		}
-		if retrying.Spec.MaxAttempts != current.MaxAttempts {
-			return job{}, fixture{}, fmt.Errorf("%s did not use reloaded default max_attempts: %+v", label, retrying.Spec)
-		}
-		if removeErr := os.Remove(chunkPath); removeErr != nil {
-			return job{}, fixture{}, removeErr
-		}
-		if fifoErr := syscall.Mkfifo(chunkPath, 0o600); fifoErr != nil {
-			return job{}, fixture{}, fifoErr
-		}
-		if chownErr := os.Chown(chunkPath, 0, int(activeCandidateGID)); chownErr != nil {
-			return job{}, fixture{}, chownErr
-		}
-		if chmodErr := os.Chmod(chunkPath, 0o640); chmodErr != nil {
-			return job{}, fixture{}, chmodErr
-		}
-		openedWriter := make(chan fifoOpenResult, 1)
-		go func() {
-			file, openErr := os.OpenFile(chunkPath, os.O_WRONLY, 0)
-			openedWriter <- fifoOpenResult{path: chunkPath, file: file, openedAt: time.Now(), err: openErr}
-		}()
+	verifyRetryTiming := func(label string, current configFile) ([]job, fixture, error) {
+		const sampleCount = 3
 		base := time.Duration(current.RetryBaseMS) * time.Millisecond
-		minimum := base - 35*time.Millisecond
-		maximum := time.Duration(current.RetryBaseMS)*time.Millisecond + upperSlack
-		remaining := time.Until(failureReleasedAt.Add(maximum))
-		if remaining <= 0 {
-			return job{}, fixture{}, fmt.Errorf("%s exhausted retry observation window before FIFO setup", label)
+		tolerance := base / 10
+		if tolerance < 50*time.Millisecond {
+			tolerance = 50 * time.Millisecond
 		}
-		var opened fifoOpenResult
-		select {
-		case opened = <-openedWriter:
-		case <-time.After(remaining):
-			return job{}, fixture{}, fmt.Errorf("%s retry did not reopen the controlled chunk within %s", label, maximum)
+		hardMaximum := base + 500*time.Millisecond
+		completed := make([]job, 0, sampleCount)
+		elapsedSamples := make([]time.Duration, 0, sampleCount)
+		var boundaryFixture fixture
+
+		for sample := 0; sample < sampleCount; sample++ {
+			sampleLabel := fmt.Sprintf("%s-%d", label, sample+1)
+			retryData := v.bytes(7777 + sample)
+			retryFixture, chunkPath, fixtureErr := v.makeFIFOFixture(directory, sampleLabel+" fixture", retryData)
+			if fixtureErr != nil {
+				return nil, fixture{}, fixtureErr
+			}
+			if sample == 0 {
+				boundaryFixture = retryFixture
+			}
+			retryStatus, retrySubmit, retryRaw, submitErr := svc.submit(jobSpec{
+				RequestID: v.token(sampleLabel), Manifest: retryFixture.Manifest,
+				Destination: filepath.Join(directory, "retry archive", sampleLabel+".bin"),
+			})
+			if submitErr != nil || retryStatus != http.StatusAccepted {
+				return nil, fixture{}, fmt.Errorf("%s submit status=%d err=%v body=%s", sampleLabel, retryStatus, submitErr, strings.TrimSpace(string(retryRaw)))
+			}
+			firstWriterResult := make(chan fifoOpenResult, 1)
+			go func() {
+				file, openErr := os.OpenFile(chunkPath, os.O_WRONLY, 0)
+				firstWriterResult <- fifoOpenResult{path: chunkPath, file: file, openedAt: time.Now(), err: openErr}
+			}()
+			var firstWriter fifoOpenResult
+			select {
+			case firstWriter = <-firstWriterResult:
+			case <-time.After(3 * time.Second):
+				return nil, fixture{}, fmt.Errorf("%s first attempt did not open the controlled chunk", sampleLabel)
+			}
+			if firstWriter.err != nil {
+				return nil, fixture{}, firstWriter.err
+			}
+			// Deliberately leave the chunk one byte short. The publisher cannot
+			// classify the attempt until Close exposes EOF, giving the verifier a
+			// real failure trigger rather than a checksum/scheduler race.
+			if _, writeErr := firstWriter.file.Write(retryData[:len(retryData)-1]); writeErr != nil {
+				_ = firstWriter.file.Close()
+				return nil, fixture{}, writeErr
+			}
+			failureReleaseStartedAt := time.Now()
+			if closeErr := firstWriter.file.Close(); closeErr != nil {
+				return nil, fixture{}, closeErr
+			}
+			retrying, waitErr := waitForJob(svc, retrySubmit.Job.ID, 2*time.Second, func(value job) bool {
+				return value.Status == "retry_wait" && value.Attempts == 1
+			})
+			if waitErr != nil {
+				return nil, fixture{}, waitErr
+			}
+			if retrying.Spec.MaxAttempts != current.MaxAttempts {
+				return nil, fixture{}, fmt.Errorf("%s did not use reloaded default max_attempts: %+v", sampleLabel, retrying.Spec)
+			}
+			if removeErr := os.Remove(chunkPath); removeErr != nil {
+				return nil, fixture{}, removeErr
+			}
+			if fifoErr := syscall.Mkfifo(chunkPath, 0o600); fifoErr != nil {
+				return nil, fixture{}, fifoErr
+			}
+			if chownErr := os.Chown(chunkPath, 0, int(activeCandidateGID)); chownErr != nil {
+				return nil, fixture{}, chownErr
+			}
+			if chmodErr := os.Chmod(chunkPath, 0o640); chmodErr != nil {
+				return nil, fixture{}, chmodErr
+			}
+			openedWriter := make(chan fifoOpenResult, 1)
+			go func() {
+				file, openErr := os.OpenFile(chunkPath, os.O_WRONLY, 0)
+				openedWriter <- fifoOpenResult{path: chunkPath, file: file, openedAt: time.Now(), err: openErr}
+			}()
+			remaining := time.Until(failureReleaseStartedAt.Add(hardMaximum))
+			if remaining <= 0 {
+				return nil, fixture{}, fmt.Errorf("%s exhausted hard retry observation window before FIFO setup", sampleLabel)
+			}
+			var opened fifoOpenResult
+			select {
+			case opened = <-openedWriter:
+			case <-time.After(remaining):
+				return nil, fixture{}, fmt.Errorf("%s retry did not reopen the controlled chunk within %s", sampleLabel, hardMaximum)
+			}
+			if opened.err != nil {
+				return nil, fixture{}, opened.err
+			}
+			elapsed := opened.openedAt.Sub(failureReleaseStartedAt)
+			if elapsed < base {
+				_ = opened.file.Close()
+				return nil, fixture{}, fmt.Errorf("%s retry_base_ms=%d reopened too early: elapsed=%s", sampleLabel, current.RetryBaseMS, elapsed)
+			}
+			if elapsed >= hardMaximum {
+				_ = opened.file.Close()
+				return nil, fixture{}, fmt.Errorf("%s retry_base_ms=%d exceeded hard maximum %s: elapsed=%s", sampleLabel, current.RetryBaseMS, hardMaximum, elapsed)
+			}
+			elapsedSamples = append(elapsedSamples, elapsed)
+			if _, writeErr := opened.file.Write(retryData); writeErr != nil {
+				_ = opened.file.Close()
+				return nil, fixture{}, writeErr
+			}
+			if closeErr := opened.file.Close(); closeErr != nil {
+				return nil, fixture{}, closeErr
+			}
+			retried, terminalErr := waitTerminal(svc, retrySubmit.Job.ID, 5*time.Second)
+			if terminalErr != nil {
+				return nil, fixture{}, terminalErr
+			}
+			if retried.Status != "succeeded" || retried.Attempts != 2 {
+				return nil, fixture{}, fmt.Errorf("%s retry completion mismatch: %+v", sampleLabel, retried)
+			}
+			completed = append(completed, retried)
 		}
-		if opened.err != nil {
-			return job{}, fixture{}, opened.err
+
+		sort.Slice(elapsedSamples, func(left, right int) bool { return elapsedSamples[left] < elapsedSamples[right] })
+		median := elapsedSamples[len(elapsedSamples)/2]
+		maximum := base + tolerance
+		if median >= maximum {
+			return nil, fixture{}, fmt.Errorf("%s retry_base_ms=%d median outside [%s,%s): samples=%v", label, current.RetryBaseMS, base, maximum, elapsedSamples)
 		}
-		elapsed := opened.openedAt.Sub(failureReleasedAt)
-		if elapsed < minimum || elapsed >= maximum {
-			_ = opened.file.Close()
-			return job{}, fixture{}, fmt.Errorf("%s retry_base_ms=%d opened outside [%s,%s): elapsed=%s", label, current.RetryBaseMS, minimum, maximum, elapsed)
-		}
-		if _, writeErr := opened.file.Write(retryData); writeErr != nil {
-			_ = opened.file.Close()
-			return job{}, fixture{}, writeErr
-		}
-		if closeErr := opened.file.Close(); closeErr != nil {
-			return job{}, fixture{}, closeErr
-		}
-		retried, terminalErr := waitTerminal(svc, retrySubmit.Job.ID, 5*time.Second)
-		if terminalErr != nil {
-			return job{}, fixture{}, terminalErr
-		}
-		if retried.Status != "succeeded" || retried.Attempts != 2 {
-			return job{}, fixture{}, fmt.Errorf("%s retry completion mismatch: %+v", label, retried)
-		}
-		return retried, retryFixture, nil
+		return completed, boundaryFixture, nil
 	}
 
-	fastRetry, retryFixture, err := verifyRetryTiming("reload-retry-fast", scaledDown, 300*time.Millisecond)
+	fastRetries, retryFixture, err := verifyRetryTiming("reload-retry-fast", scaledDown)
 	if err != nil {
 		return err
 	}
-	reloadCompleted = append(reloadCompleted, fastRetry)
+	reloadCompleted = append(reloadCompleted, fastRetries...)
 
 	slowerRetryConfig := scaledDown
 	slowerRetryConfig.RetryBaseMS = v.intBetween(1100, 1200)
@@ -2053,11 +2138,11 @@ func testTransactionalReload(v *verifier) error {
 	if slowerStats.Config != (configSnapshot{Generation: 5, configFile: slowerRetryConfig}) || slowerStats.Runtime.ActiveWorkerLimit != 1 {
 		return fmt.Errorf("second retry-base reload not coherent: %+v", slowerStats)
 	}
-	slowRetry, _, err := verifyRetryTiming("reload-retry-slow", slowerRetryConfig, 350*time.Millisecond)
+	slowRetries, _, err := verifyRetryTiming("reload-retry-slow", slowerRetryConfig)
 	if err != nil {
 		return err
 	}
-	reloadCompleted = append(reloadCompleted, slowRetry)
+	reloadCompleted = append(reloadCompleted, slowRetries...)
 
 	boundarySpec := jobSpec{
 		RequestID: v.token("reload-size-within"), Manifest: retryFixture.Manifest,
@@ -2106,7 +2191,10 @@ func testTransactionalReload(v *verifier) error {
 }
 
 func testPeriodicSnapshotAndListenerPolicy(v *verifier) error {
-	directory := filepath.Join(v.root, "periodic snapshot listener")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := prepareTestDirectory(directory); err != nil {
 		return err
 	}
@@ -2317,7 +2405,10 @@ func testPeriodicSnapshotAndListenerPolicy(v *verifier) error {
 }
 
 func testConcurrentWALCompaction(v *verifier) error {
-	directory := filepath.Join(v.root, "concurrent wal compact")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
@@ -2511,17 +2602,43 @@ func testConcurrentWALCompaction(v *verifier) error {
 		return fmt.Errorf("post-compact WAL does not contain real typed transitions: %v", sentinelTransitions)
 	}
 
-	address, err := reserveAddress()
+	// Prove the declared files are sufficient by booting from a fresh state
+	// directory containing only the canonical snapshot, WAL, and receipt
+	// ledger. Any candidate-only sidecar remains behind in the original state.
+	canonicalState, err := secureDirectory(directory)
 	if err != nil {
 		return err
 	}
-	cfg.Listen = address
-	if err := writeJSON(configPath, cfg); err != nil {
+	canonicalFiles := []string{"events.wal", "receipts.jsonl", "snapshot.json"}
+	for _, name := range canonicalFiles {
+		raw, readErr := os.ReadFile(filepath.Join(cfg.StateDir, name))
+		if readErr != nil {
+			return fmt.Errorf("read canonical %s: %w", name, readErr)
+		}
+		if writeErr := os.WriteFile(filepath.Join(canonicalState, name), raw, 0o600); writeErr != nil {
+			return fmt.Errorf("copy canonical %s: %w", name, writeErr)
+		}
+	}
+	if names, namesErr := directoryNames(canonicalState); namesErr != nil || strings.Join(names, ",") != strings.Join(canonicalFiles, ",") {
+		return fmt.Errorf("canonical-only state contents=%v err=%v", names, namesErr)
+	}
+	canonicalConfig := cfg
+	canonicalConfig.StateDir = canonicalState
+	canonicalConfig.Listen, err = reserveAddress()
+	if err != nil {
 		return err
 	}
-	restarted, err := startService(v.binDir, configPath, &cfg, filepath.Join(directory, "logs-two"))
+	configName, err := secureRandomName()
 	if err != nil {
-		return fmt.Errorf("restart after concurrent compaction: %w", err)
+		return err
+	}
+	canonicalConfigPath := filepath.Join(directory, configName+".json")
+	if err := writeJSON(canonicalConfigPath, canonicalConfig); err != nil {
+		return err
+	}
+	restarted, err := startService(v.binDir, canonicalConfigPath, &canonicalConfig, filepath.Join(directory, "logs-two"))
+	if err != nil {
+		return fmt.Errorf("canonical-only restart after concurrent compaction: %w", err)
 	}
 	defer restarted.kill()
 	for index, outcome := range outcomes {
@@ -2540,7 +2657,7 @@ func testConcurrentWALCompaction(v *verifier) error {
 		expectedReceipts = append(expectedReceipts, durableJobs[outcome.jobID])
 	}
 	expectedReceipts = append(expectedReceipts, durableJobs[sentinelSubmit.Job.ID])
-	if err := assertExactReceipts(filepath.Join(cfg.StateDir, "receipts.jsonl"), expectedReceipts); err != nil {
+	if err := assertExactReceipts(filepath.Join(canonicalConfig.StateDir, "receipts.jsonl"), expectedReceipts); err != nil {
 		return fmt.Errorf("concurrent compaction completion receipts: %w", err)
 	}
 	if err := restarted.stop(); err != nil {
@@ -2550,7 +2667,10 @@ func testConcurrentWALCompaction(v *verifier) error {
 }
 
 func testCompactionCrashRecovery(v *verifier) error {
-	directory := filepath.Join(v.root, "compaction crash nonterminal")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
@@ -2851,7 +2971,10 @@ func testCompactionCrashRecovery(v *verifier) error {
 }
 
 func testCorruptionFailsClosed(v *verifier) error {
-	directory := filepath.Join(v.root, "corrupt state")
+	directory, err := v.caseDirectory()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
@@ -2913,6 +3036,19 @@ func testCorruptionFailsClosed(v *verifier) error {
 	originalSnapshot, err := os.ReadFile(sourceSnapshot)
 	if err != nil {
 		return err
+	}
+	sourceReceipts := filepath.Join(cfg.StateDir, "receipts.jsonl")
+	originalReceipts, err := os.ReadFile(sourceReceipts)
+	if err != nil {
+		return err
+	}
+	receiptLines := bytes.Split(bytes.TrimSuffix(originalReceipts, []byte{'\n'}), []byte{'\n'})
+	if len(receiptLines) != 2 {
+		return fmt.Errorf("source receipt line count=%d expected=2", len(receiptLines))
+	}
+	parsedReceipts, err := readReceipts(sourceReceipts)
+	if err != nil || len(parsedReceipts) != 2 {
+		return fmt.Errorf("source receipts invalid: count=%d err=%v", len(parsedReceipts), err)
 	}
 	frames, err := parseRawWALFrames(originalWAL)
 	if err != nil || len(frames) < 3 {
@@ -3091,7 +3227,10 @@ func testCorruptionFailsClosed(v *verifier) error {
 		}},
 	}
 	for _, item := range cases {
-		caseDir := filepath.Join(directory, item.name)
+		caseDir, caseErr := secureDirectory(directory)
+		if caseErr != nil {
+			return caseErr
+		}
 		if err := prepareTestDirectory(caseDir); err != nil {
 			return err
 		}
@@ -3134,6 +3273,111 @@ func testCorruptionFailsClosed(v *verifier) error {
 			return err
 		}
 		if !bytes.Equal(afterWAL, mutatedWAL) || !bytes.Equal(afterSnapshot, mutatedSnapshot) {
+			return fmt.Errorf("%s startup rewrote forensic state", item.name)
+		}
+	}
+
+	encodeReceiptLines := func(lines [][]byte) []byte {
+		return append(bytes.Join(lines, []byte{'\n'}), '\n')
+	}
+	type receiptDamageCase struct {
+		name   string
+		mutate func() ([]byte, error)
+	}
+	receiptCases := []receiptDamageCase{
+		{name: "truncated-receipt", mutate: func() ([]byte, error) {
+			return append(append([]byte(nil), originalReceipts...), []byte(`{"version":1`)...), nil
+		}},
+		{name: "unknown-receipt-field", mutate: func() ([]byte, error) {
+			lines := make([][]byte, len(receiptLines))
+			for index := range receiptLines {
+				lines[index] = append([]byte(nil), receiptLines[index]...)
+			}
+			lines[0] = append(append([]byte(nil), lines[0][:len(lines[0])-1]...), []byte(`,"unexpected":true}`)...)
+			return encodeReceiptLines(lines), nil
+		}},
+		{name: "trailing-receipt-json", mutate: func() ([]byte, error) {
+			lines := make([][]byte, len(receiptLines))
+			for index := range receiptLines {
+				lines[index] = append([]byte(nil), receiptLines[index]...)
+			}
+			lines[0] = append(lines[0], []byte(`{}`)...)
+			return encodeReceiptLines(lines), nil
+		}},
+		{name: "duplicate-receipt-job", mutate: func() ([]byte, error) {
+			return append(append([]byte(nil), originalReceipts...), append(append([]byte(nil), receiptLines[0]...), '\n')...), nil
+		}},
+		{name: "duplicate-receipt-request", mutate: func() ([]byte, error) {
+			duplicate := parsedReceipts[0]
+			duplicate.JobID += "-other"
+			raw, marshalErr := json.Marshal(duplicate)
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
+			return append(append([]byte(nil), originalReceipts...), append(raw, '\n')...), nil
+		}},
+		{name: "receipt-completion-conflict", mutate: func() ([]byte, error) {
+			lines := make([][]byte, len(receiptLines))
+			for index := range receiptLines {
+				lines[index] = append([]byte(nil), receiptLines[index]...)
+			}
+			conflict := parsedReceipts[0]
+			conflict.Destination += ".conflict"
+			raw, marshalErr := json.Marshal(conflict)
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
+			lines[0] = raw
+			return encodeReceiptLines(lines), nil
+		}},
+	}
+	for _, item := range receiptCases {
+		caseDir, caseErr := secureDirectory(directory)
+		if caseErr != nil {
+			return caseErr
+		}
+		if err := prepareTestDirectory(caseDir); err != nil {
+			return err
+		}
+		stateDir := filepath.Join(caseDir, "state")
+		if err := copyTree(cfg.StateDir, stateDir); err != nil {
+			return err
+		}
+		mutatedReceipts, mutateErr := item.mutate()
+		if mutateErr != nil {
+			return fmt.Errorf("construct %s damage: %w", item.name, mutateErr)
+		}
+		receiptPath := filepath.Join(stateDir, "receipts.jsonl")
+		if err := os.WriteFile(receiptPath, mutatedReceipts, 0o600); err != nil {
+			return err
+		}
+		caseConfig := cfg
+		caseConfig.StateDir = stateDir
+		caseConfig.Listen, err = reserveAddress()
+		if err != nil {
+			return err
+		}
+		caseConfigPath := filepath.Join(caseDir, "relay.json")
+		if err := writeJSON(caseConfigPath, caseConfig); err != nil {
+			return err
+		}
+		output, startupErr := expectStartupFailure(v.binDir, caseConfigPath, &caseConfig, 1500*time.Millisecond)
+		if startupErr != nil {
+			return fmt.Errorf("%s did not fail closed: %w output=%s", item.name, startupErr, strings.TrimSpace(output))
+		}
+		afterWAL, readErr := os.ReadFile(filepath.Join(stateDir, "events.wal"))
+		if readErr != nil {
+			return readErr
+		}
+		afterSnapshot, readErr := os.ReadFile(filepath.Join(stateDir, "snapshot.json"))
+		if readErr != nil {
+			return readErr
+		}
+		afterReceipts, readErr := os.ReadFile(receiptPath)
+		if readErr != nil {
+			return readErr
+		}
+		if !bytes.Equal(afterWAL, originalWAL) || !bytes.Equal(afterSnapshot, originalSnapshot) || !bytes.Equal(afterReceipts, mutatedReceipts) {
 			return fmt.Errorf("%s startup rewrote forensic state", item.name)
 		}
 	}

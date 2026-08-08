@@ -25,7 +25,7 @@ export GOTOOLCHAIN=local
 export GOFLAGS=-mod=readonly
 export CGO_ENABLED=0
 
-work_dir="$(mktemp -d /tmp/durable-relay-verifier.XXXXXX)"
+work_dir="$(mktemp -d /tmp/.XXXXXXXXXXXX)"
 bin_dir="${work_dir}/bin"
 root_cache="${work_dir}/root-gocache"
 install -d -m 0700 "${bin_dir}" "${root_cache}"
@@ -33,6 +33,12 @@ export GOCACHE="${root_cache}"
 export GOPATH="${work_dir}/root-gopath"
 
 cd /app
+if /bin/grep -R -n -E 'Gete?uid|DURABLE_RELAY_TEST_SEED|durable-relay-(integration|verifier)|candidate_uid' \
+    --include='*.go' --exclude-dir='.git' . > /logs/verifier/environment-fingerprint.log; then
+    cat /logs/verifier/environment-fingerprint.log
+    printf '%s\n' 'candidate source contains a verifier-environment fingerprint' >&2
+    exit 1
+fi
 /usr/local/go/bin/go build -trimpath -buildvcs=false -o "${work_dir}/verifier" /tests/support.go /tests/verifier.go
 /usr/local/go/bin/go build -trimpath -buildvcs=false -o "${bin_dir}/relayqd" ./cmd/relayqd
 /usr/local/go/bin/go build -trimpath -buildvcs=false -o "${bin_dir}/relayctl" ./cmd/relayctl
